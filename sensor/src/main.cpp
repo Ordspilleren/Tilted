@@ -1,27 +1,11 @@
 #include <ESP8266WiFi.h>
+#include <espnow.h>
 #include <Wire.h>
-#include <PubSubClient.h>
-#include <ArduinoJson.h>
 #include "I2Cdev.h"
 #include "MPU6050_6Axis_MotionApps20.h"
-#include <CREDENTIALS.h>
 
 // Set ADC mode for voltage reading.
 ADC_MODE(ADC_VCC);
-
-// Set up static IP and WiFi details
-IPAddress ip(10, 3, 3, 6);
-IPAddress gateway(10, 3, 3, 1);
-IPAddress mask(255, 255, 255, 0);
-const char* ssid = WIFI_SSID;
-const char* password = WIFI_PASS;
-
-// MQTT config
-const char* mqtt_server = MQTT_SERVER;
-WiFiClient espClient;
-PubSubClient client(espClient);
-
-#define MQTT_TOPIC "tilted/data"
 
 // Maximum time to be awake, in ms. This is needed in case the MPU sensor
 // fails to return any samples.
@@ -52,10 +36,24 @@ PubSubClient client(espClient);
 #define LOW_VOLTAGE_THRESHOLD 3000
 #define LOW_VOLTAGE_MULTIPLIER 4
 
+// the following three settings must match the slave settings
+uint8_t remoteMac[] = {0x3A, 0x33, 0x33, 0x33, 0x33, 0x33};
+const uint8_t channel = 11;
+struct __attribute__((packed)) DataStruct
+{
+	float tilt;
+	float temp;
+	int volt;
+	long interval;
+};
+
+DataStruct tiltData;
+
 // when we booted
 static unsigned long bootTime, wifiTime, mqttTime, sent = 0;
 
-RF_PRE_INIT() {
+RF_PRE_INIT()
+{
 	bootTime = millis();
 }
 
@@ -115,8 +113,9 @@ static void actuallySleep()
 //-----------------------------------------------------------------
 static int voltage = 0;
 
-static inline double readVoltage() {
-  return (voltage = ESP.getVcc());
+static inline double readVoltage()
+{
+	return (voltage = ESP.getVcc());
 }
 
 //--------------------------------------------------------------
@@ -141,40 +140,29 @@ static void sendSensorData()
 		sum += samples[i];
 	}
 
-	// Serialize data as JSON before sending.
-	StaticJsonDocument<200> doc;
-	doc["tilt"] = round1(sum / nsamples);
-	doc["temp"] = round1(temperature);
-	doc["volt"] = voltage;
-	doc["interval"] = sleep_interval;
+	tiltData.tilt = round1(sum / nsamples);
+	tiltData.temp = round1(temperature);
+	tiltData.volt = voltage;
+	tiltData.interval = sleep_interval;
 
-	char jsonString[200];
-	serializeJson(doc, jsonString);
-
-	// Connect to WiFi and send with MQTT.
 	WiFi.mode(WIFI_STA);
-	WiFi.config(ip, gateway, mask);
-	WiFi.begin(ssid, password);
 
-	while(WiFi.status() != WL_CONNECTED && (millis() - bootTime) < WAKE_TIMEOUT) {
+	while (esp_now_init() != 0 && (millis() - bootTime) < WAKE_TIMEOUT)
+	{
 		delay(5);
 	}
 
+	esp_now_set_self_role(ESP_NOW_ROLE_CONTROLLER);
+	esp_now_add_peer(remoteMac, ESP_NOW_ROLE_SLAVE, channel, NULL, 0);
+	//esp_now_register_send_cb(sendCallBackFunction);
+
 	wifiTime = millis();
 
-	client.setServer(mqtt_server, 1883);
+	uint8_t bs[sizeof(tiltData)];
+	memcpy(bs, &tiltData, sizeof(tiltData));
 
-	String clientId = "Tilted-";
-	clientId += String(random(0xffff), HEX);
-
-	while (!client.connected() && (millis() - bootTime) < WAKE_TIMEOUT) {
-		if (client.connect(clientId.c_str())) {
-			client.publish(MQTT_TOPIC, jsonString, true);
-			sent = millis();
-		} else {
-			delay(5);
-		}
-	}
+	esp_now_send(NULL, bs, sizeof(tiltData)); // NULL means send to all peers
+	sent = millis();
 
 	mqttTime = millis();
 }
@@ -219,7 +207,7 @@ void setup()
 		sleep_interval = CALIBRATION_INTERVAL;
 	}
 
-	/* INITIALIZE MPU
+	// INITIALIZE MPU
 	Serial.println("Starting MPU-6050");
 	Wire.begin(SDA_PIN, SCL_PIN);
 	Wire.setClock(400000);
@@ -234,7 +222,6 @@ void setup()
 	mpu.setInterruptDrive(1); // Open drain
 	mpu.setRate(17);
 	mpu.setIntDataReadyEnabled(true);
-	*/
 
 	Serial.println("Finished setup");
 }
@@ -256,14 +243,14 @@ void loop()
 	{
 		actuallySleep();
 	}
-	//else if (nsamples < MAX_SAMPLES && mpu.getIntDataReadyStatus())
-	else if (nsamples < MAX_SAMPLES)
+	else if (nsamples < MAX_SAMPLES && mpu.getIntDataReadyStatus())
+	//else if (nsamples < MAX_SAMPLES)
 	{
 		int16_t ax, ay, az;
-		ax = 1;
-		ay = 2;
-		az = 3;
-		//mpu.getAcceleration(&ax, &az, &ay);
+		//ax = 1;
+		//ay = 2;
+		//az = 3;
+		mpu.getAcceleration(&ax, &az, &ay);
 
 		float tilt = calculateTilt(ax, az, ay);
 		if (tilt > 0.0)
@@ -275,13 +262,14 @@ void loop()
 
 		if (nsamples >= MAX_SAMPLES)
 		{
-			// As soon as we have all our samples, read the temperature
-			//temperature = mpu.getTemperature() / 340.0 + 36.53;
-			temperature = 25.0;
+			// As soon as we have all our samples, read the temperature.
+			// This offset is from the MPU documentation. Displays temperature in degrees C.
+			temperature = mpu.getTemperature() / 340.0 + 36.53;
+			//temperature = 25.0;
 
 			// ... and put the MPU back to sleep. No reason for it to
 			// be sampling while we're doing networky things.
-			//putMpuToSleep();
+			putMpuToSleep();
 
 			// no need to wait for the delay
 			sendSensorData();
