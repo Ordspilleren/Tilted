@@ -146,6 +146,7 @@ static void sendSensorData()
 	tiltData.interval = sleep_interval;
 
 	WiFi.mode(WIFI_STA);
+	WiFi.disconnect();
 
 	while (esp_now_init() != 0 && (millis() - bootTime) < WAKE_TIMEOUT)
 	{
