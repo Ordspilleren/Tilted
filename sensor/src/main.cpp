@@ -15,9 +15,6 @@ ADC_MODE(ADC_VCC);
 #define SDA_PIN 4
 #define SCL_PIN 5
 
-// pull low to run in calibration mode
-#define CALIBRATE_PIN 14
-
 // number of tilt samples to average
 #define MAX_SAMPLES 5
 
@@ -27,7 +24,12 @@ ADC_MODE(ADC_VCC);
 #define NORMAL_INTERVAL 1800
 
 // In calibration mode, we need more frequent updates.
+// Here we define the RTC address to use and the number of iterations.
+// 60 iterations with an interval of 30 equals 30 minutes.
 #define CALIBRATION_INTERVAL 30
+#define RTC_ADDRESS 0
+#define CALIBRATION_ITERATIONS 60
+#define CALIBRATION_TILT_ANGLE 20
 
 // When the battery cell (default assumes NiMH) gets this low,
 // the ESP switches to every
@@ -51,6 +53,8 @@ DataStruct tiltData;
 
 // when we booted
 static unsigned long bootTime, wifiTime, mqttTime, sent = 0;
+
+uint32_t calibrationIterations = 0;
 
 RF_PRE_INIT()
 {
@@ -168,12 +172,19 @@ static void sendSensorData()
 	mqttTime = millis();
 }
 
+static float calculateTilt(float ax, float az, float ay)
+{
+	float pitch = (atan2(ay, sqrt(ax * ax + az * az))) * 180.0 / PI;
+	float roll = (atan2(ax, sqrt(ay * ay + az * az))) * 180.0 / PI;
+	return sqrt(pitch * pitch + roll * roll);
+}
+
+static bool isCalibrationMode() {
+	return (calibrationIterations != 0) ? true : false;
+}
+
 void setup()
 {
-	// Connect GPIO 16 to RST to wake up.
-	// Possibly only needed on Wemos D1
-	pinMode(16, WAKEUP_PULLUP);
-
 	pinMode(led, OUTPUT);
 	ledOff();
 
@@ -184,29 +195,6 @@ void setup()
 	Serial.println(ESP.getResetReason());
 
 	Serial.println("Build: " __DATE__ " " __TIME__);
-
-	pinMode(CALIBRATE_PIN, INPUT_PULLUP);
-	if (digitalRead(CALIBRATE_PIN))
-	{
-		Serial.println("Normal mode");
-
-		readVoltage();
-		Serial.println(voltage);
-		bool lowv = !(voltage != 0 && voltage > LOW_VOLTAGE_THRESHOLD);
-		if (lowv)
-		{
-			Serial.println("Voltage below threshold, sleeping longer");
-			sleep_interval *= LOW_VOLTAGE_MULTIPLIER;
-		}
-	}
-	else
-	{
-		Serial.println("Calibration mode");
-
-		// The only difference between "normal" and "calibration"
-		// is the update frequency. We still deep sleep between samples.
-		sleep_interval = CALIBRATION_INTERVAL;
-	}
 
 	// INITIALIZE MPU
 	Serial.println("Starting MPU-6050");
@@ -224,14 +212,59 @@ void setup()
 	mpu.setRate(17);
 	mpu.setIntDataReadyEnabled(true);
 
-	Serial.println("Finished setup");
-}
+	// Read RTC memory to get current number of calibration iterations.
+	ESP.rtcUserMemoryRead(RTC_ADDRESS, &calibrationIterations, sizeof(calibrationIterations));
 
-static float calculateTilt(float ax, float az, float ay)
-{
-	float pitch = (atan2(ay, sqrt(ax * ax + az * az))) * 180.0 / PI;
-	float roll = (atan2(ax, sqrt(ay * ay + az * az))) * 180.0 / PI;
-	return sqrt(pitch * pitch + roll * roll);
+	rst_info *resetInfo;
+	resetInfo = ESP.getResetInfoPtr();
+	if (resetInfo->reason != REASON_DEEP_SLEEP_AWAKE)
+	{
+		// Wait 30 seconds to allow the user to position the device.
+		delay(30000);
+
+		while (!mpu.getIntDataReadyStatus())
+		{
+			delay(5);
+		}
+
+		int16_t ax, ay, az;
+		mpu.getAcceleration(&ax, &az, &ay);
+		float tilt = calculateTilt(ax, az, ay);
+
+		if (tilt < CALIBRATION_TILT_ANGLE)
+		{
+			Serial.println("Initiate calibration mode");
+
+			// The only difference between "normal" and "calibration"
+			// is the update frequency. We still deep sleep between samples.
+			sleep_interval = CALIBRATION_INTERVAL;
+			calibrationIterations = 1;
+			ESP.rtcUserMemoryWrite(RTC_ADDRESS, &calibrationIterations, sizeof(calibrationIterations));
+		}
+	}
+	else if (isCalibrationMode() && calibrationIterations < CALIBRATION_ITERATIONS)
+	{
+		Serial.printf("Calibration mode, %d iterations...", calibrationIterations);
+
+		sleep_interval = CALIBRATION_INTERVAL;
+		calibrationIterations += 1;
+		ESP.rtcUserMemoryWrite(RTC_ADDRESS, &calibrationIterations, sizeof(calibrationIterations));
+	}
+	else
+	{
+		Serial.println("Normal mode");
+
+		readVoltage();
+		Serial.println(voltage);
+		bool lowv = !(voltage != 0 && voltage > LOW_VOLTAGE_THRESHOLD);
+		if (lowv)
+		{
+			Serial.println("Voltage below threshold, sleeping longer");
+			sleep_interval *= LOW_VOLTAGE_MULTIPLIER;
+		}
+	}
+
+	Serial.println("Finished setup");
 }
 
 void loop()
@@ -240,7 +273,7 @@ void loop()
 	{
 		actuallySleep();
 	}
-	else if ((millis() - bootTime) > WAKE_TIMEOUT)
+	else if ((millis() - bootTime) > WAKE_TIMEOUT && !isCalibrationMode())
 	{
 		actuallySleep();
 	}

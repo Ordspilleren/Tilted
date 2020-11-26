@@ -146,7 +146,6 @@ void loop()
     if (haveReading) {
         haveReading = false;
         wifiConnect();
-        reconnectMQTT();
         publishMQTT();
         ESP.restart();
     }
