@@ -1,27 +1,11 @@
 #include <ESP8266WiFi.h>
+#include <espnow.h>
 #include <Wire.h>
-#include <PubSubClient.h>
-#include <ArduinoJson.h>
 #include "I2Cdev.h"
 #include "MPU6050_6Axis_MotionApps20.h"
-#include <CREDENTIALS.h>
 
 // Set ADC mode for voltage reading.
 ADC_MODE(ADC_VCC);
-
-// Set up static IP and WiFi details
-IPAddress ip(10, 3, 3, 6);
-IPAddress gateway(10, 3, 3, 1);
-IPAddress mask(255, 255, 255, 0);
-const char* ssid = WIFI_SSID;
-const char* password = WIFI_PASS;
-
-// MQTT config
-const char* mqtt_server = MQTT_SERVER;
-WiFiClient espClient;
-PubSubClient client(espClient);
-
-#define MQTT_TOPIC "tilted/data"
 
 // Maximum time to be awake, in ms. This is needed in case the MPU sensor
 // fails to return any samples.
@@ -30,9 +14,6 @@ PubSubClient client(espClient);
 // I2C pins
 #define SDA_PIN 4
 #define SCL_PIN 5
-
-// pull low to run in calibration mode
-#define CALIBRATE_PIN 14
 
 // number of tilt samples to average
 #define MAX_SAMPLES 5
@@ -43,7 +24,12 @@ PubSubClient client(espClient);
 #define NORMAL_INTERVAL 1800
 
 // In calibration mode, we need more frequent updates.
+// Here we define the RTC address to use and the number of iterations.
+// 60 iterations with an interval of 30 equals 30 minutes.
 #define CALIBRATION_INTERVAL 30
+#define RTC_ADDRESS 0
+#define CALIBRATION_ITERATIONS 60
+#define CALIBRATION_TILT_ANGLE 20
 
 // When the battery cell (default assumes NiMH) gets this low,
 // the ESP switches to every
@@ -52,10 +38,26 @@ PubSubClient client(espClient);
 #define LOW_VOLTAGE_THRESHOLD 3000
 #define LOW_VOLTAGE_MULTIPLIER 4
 
+// the following three settings must match the slave settings
+uint8_t remoteMac[] = {0x3A, 0x33, 0x33, 0x33, 0x33, 0x33};
+const uint8_t channel = 11;
+struct __attribute__((packed)) DataStruct
+{
+	float tilt;
+	float temp;
+	int volt;
+	long interval;
+};
+
+DataStruct tiltData;
+
 // when we booted
 static unsigned long bootTime, wifiTime, mqttTime, sent = 0;
 
-RF_PRE_INIT() {
+uint32_t calibrationIterations = 0;
+
+RF_PRE_INIT()
+{
 	bootTime = millis();
 }
 
@@ -115,8 +117,9 @@ static void actuallySleep()
 //-----------------------------------------------------------------
 static int voltage = 0;
 
-static inline double readVoltage() {
-  return (voltage = ESP.getVcc());
+static inline double readVoltage()
+{
+	return (voltage = ESP.getVcc());
 }
 
 //--------------------------------------------------------------
@@ -141,50 +144,47 @@ static void sendSensorData()
 		sum += samples[i];
 	}
 
-	// Serialize data as JSON before sending.
-	StaticJsonDocument<200> doc;
-	doc["tilt"] = round1(sum / nsamples);
-	doc["temp"] = round1(temperature);
-	doc["volt"] = voltage;
-	doc["interval"] = sleep_interval;
+	tiltData.tilt = round1(sum / nsamples);
+	tiltData.temp = round1(temperature);
+	tiltData.volt = voltage;
+	tiltData.interval = sleep_interval;
 
-	char jsonString[200];
-	serializeJson(doc, jsonString);
-
-	// Connect to WiFi and send with MQTT.
 	WiFi.mode(WIFI_STA);
-	WiFi.config(ip, gateway, mask);
-	WiFi.begin(ssid, password);
+	WiFi.disconnect();
 
-	while(WiFi.status() != WL_CONNECTED && (millis() - bootTime) < WAKE_TIMEOUT) {
+	while (esp_now_init() != 0 && (millis() - bootTime) < WAKE_TIMEOUT)
+	{
 		delay(5);
 	}
 
+	esp_now_set_self_role(ESP_NOW_ROLE_CONTROLLER);
+	esp_now_add_peer(remoteMac, ESP_NOW_ROLE_SLAVE, channel, NULL, 0);
+	//esp_now_register_send_cb(sendCallBackFunction);
+
 	wifiTime = millis();
 
-	client.setServer(mqtt_server, 1883);
+	uint8_t bs[sizeof(tiltData)];
+	memcpy(bs, &tiltData, sizeof(tiltData));
 
-	String clientId = "Tilted-";
-	clientId += String(random(0xffff), HEX);
-
-	while (!client.connected() && (millis() - bootTime) < WAKE_TIMEOUT) {
-		if (client.connect(clientId.c_str())) {
-			client.publish(MQTT_TOPIC, jsonString, true);
-			sent = millis();
-		} else {
-			delay(5);
-		}
-	}
+	esp_now_send(NULL, bs, sizeof(tiltData)); // NULL means send to all peers
+	sent = millis();
 
 	mqttTime = millis();
 }
 
+static float calculateTilt(float ax, float az, float ay)
+{
+	float pitch = (atan2(ay, sqrt(ax * ax + az * az))) * 180.0 / PI;
+	float roll = (atan2(ax, sqrt(ay * ay + az * az))) * 180.0 / PI;
+	return sqrt(pitch * pitch + roll * roll);
+}
+
+static bool isCalibrationMode() {
+	return (calibrationIterations != 0) ? true : false;
+}
+
 void setup()
 {
-	// Connect GPIO 16 to RST to wake up.
-	// Possibly only needed on Wemos D1
-	pinMode(16, WAKEUP_PULLUP);
-
 	pinMode(led, OUTPUT);
 	ledOff();
 
@@ -196,30 +196,7 @@ void setup()
 
 	Serial.println("Build: " __DATE__ " " __TIME__);
 
-	pinMode(CALIBRATE_PIN, INPUT_PULLUP);
-	if (digitalRead(CALIBRATE_PIN))
-	{
-		Serial.println("Normal mode");
-
-		readVoltage();
-		Serial.println(voltage);
-		bool lowv = !(voltage != 0 && voltage > LOW_VOLTAGE_THRESHOLD);
-		if (lowv)
-		{
-			Serial.println("Voltage below threshold, sleeping longer");
-			sleep_interval *= LOW_VOLTAGE_MULTIPLIER;
-		}
-	}
-	else
-	{
-		Serial.println("Calibration mode");
-
-		// The only difference between "normal" and "calibration"
-		// is the update frequency. We still deep sleep between samples.
-		sleep_interval = CALIBRATION_INTERVAL;
-	}
-
-	/* INITIALIZE MPU
+	// INITIALIZE MPU
 	Serial.println("Starting MPU-6050");
 	Wire.begin(SDA_PIN, SCL_PIN);
 	Wire.setClock(400000);
@@ -234,16 +211,60 @@ void setup()
 	mpu.setInterruptDrive(1); // Open drain
 	mpu.setRate(17);
 	mpu.setIntDataReadyEnabled(true);
-	*/
+
+	// Read RTC memory to get current number of calibration iterations.
+	ESP.rtcUserMemoryRead(RTC_ADDRESS, &calibrationIterations, sizeof(calibrationIterations));
+
+	rst_info *resetInfo;
+	resetInfo = ESP.getResetInfoPtr();
+	if (resetInfo->reason != REASON_DEEP_SLEEP_AWAKE)
+	{
+		// Wait 30 seconds to allow the user to position the device.
+		delay(30000);
+
+		while (!mpu.getIntDataReadyStatus())
+		{
+			delay(5);
+		}
+
+		int16_t ax, ay, az;
+		mpu.getAcceleration(&ax, &az, &ay);
+		float tilt = calculateTilt(ax, az, ay);
+
+		if (tilt < CALIBRATION_TILT_ANGLE)
+		{
+			Serial.println("Initiate calibration mode");
+
+			// The only difference between "normal" and "calibration"
+			// is the update frequency. We still deep sleep between samples.
+			sleep_interval = CALIBRATION_INTERVAL;
+			calibrationIterations = 1;
+			ESP.rtcUserMemoryWrite(RTC_ADDRESS, &calibrationIterations, sizeof(calibrationIterations));
+		}
+	}
+	else if (isCalibrationMode() && calibrationIterations < CALIBRATION_ITERATIONS)
+	{
+		Serial.printf("Calibration mode, %d iterations...", calibrationIterations);
+
+		sleep_interval = CALIBRATION_INTERVAL;
+		calibrationIterations += 1;
+		ESP.rtcUserMemoryWrite(RTC_ADDRESS, &calibrationIterations, sizeof(calibrationIterations));
+	}
+	else
+	{
+		Serial.println("Normal mode");
+
+		readVoltage();
+		Serial.println(voltage);
+		bool lowv = !(voltage != 0 && voltage > LOW_VOLTAGE_THRESHOLD);
+		if (lowv)
+		{
+			Serial.println("Voltage below threshold, sleeping longer");
+			sleep_interval *= LOW_VOLTAGE_MULTIPLIER;
+		}
+	}
 
 	Serial.println("Finished setup");
-}
-
-static float calculateTilt(float ax, float az, float ay)
-{
-	float pitch = (atan2(ay, sqrt(ax * ax + az * az))) * 180.0 / PI;
-	float roll = (atan2(ax, sqrt(ay * ay + az * az))) * 180.0 / PI;
-	return sqrt(pitch * pitch + roll * roll);
 }
 
 void loop()
@@ -252,18 +273,18 @@ void loop()
 	{
 		actuallySleep();
 	}
-	else if ((millis() - bootTime) > WAKE_TIMEOUT)
+	else if ((millis() - bootTime) > WAKE_TIMEOUT && !isCalibrationMode())
 	{
 		actuallySleep();
 	}
-	//else if (nsamples < MAX_SAMPLES && mpu.getIntDataReadyStatus())
-	else if (nsamples < MAX_SAMPLES)
+	else if (nsamples < MAX_SAMPLES && mpu.getIntDataReadyStatus())
+	//else if (nsamples < MAX_SAMPLES)
 	{
 		int16_t ax, ay, az;
-		ax = 1;
-		ay = 2;
-		az = 3;
-		//mpu.getAcceleration(&ax, &az, &ay);
+		//ax = 1;
+		//ay = 2;
+		//az = 3;
+		mpu.getAcceleration(&ax, &az, &ay);
 
 		float tilt = calculateTilt(ax, az, ay);
 		if (tilt > 0.0)
@@ -275,13 +296,14 @@ void loop()
 
 		if (nsamples >= MAX_SAMPLES)
 		{
-			// As soon as we have all our samples, read the temperature
-			//temperature = mpu.getTemperature() / 340.0 + 36.53;
-			temperature = 25.0;
+			// As soon as we have all our samples, read the temperature.
+			// This offset is from the MPU documentation. Displays temperature in degrees C.
+			temperature = mpu.getTemperature() / 340.0 + 36.53;
+			//temperature = 25.0;
 
 			// ... and put the MPU back to sleep. No reason for it to
 			// be sampling while we're doing networky things.
-			//putMpuToSleep();
+			putMpuToSleep();
 
 			// no need to wait for the delay
 			sendSensorData();
