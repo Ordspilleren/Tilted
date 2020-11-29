@@ -1,8 +1,10 @@
 #include <ESP8266WiFi.h>
+#include <ESP8266httpUpdate.h>
 #include <espnow.h>
 #include <Wire.h>
 #include "I2Cdev.h"
 #include "MPU6050_6Axis_MotionApps20.h"
+#include "credentials.h"
 
 // Set ADC mode for voltage reading.
 ADC_MODE(ADC_VCC);
@@ -29,7 +31,9 @@ ADC_MODE(ADC_VCC);
 #define CALIBRATION_INTERVAL 30
 #define RTC_ADDRESS 0
 #define CALIBRATION_ITERATIONS 60
-#define CALIBRATION_TILT_ANGLE 20
+#define CALIBRATION_TILT_ANGLE 10
+#define CALIBRATION_SETUP_TIME 30000
+#define WIFI_TIMEOUT 10000
 
 // When the battery cell (default assumes NiMH) gets this low,
 // the ESP switches to every
@@ -37,6 +41,9 @@ ADC_MODE(ADC_VCC);
 // someone is monitoring that stuff and can swap batteries before it really dies.
 #define LOW_VOLTAGE_THRESHOLD 3000
 #define LOW_VOLTAGE_MULTIPLIER 4
+
+// Version identifier for OTA.
+const char versionTimestamp[] = "TiltedSensor " __DATE__ " " __TIME__;
 
 // the following three settings must match the slave settings
 uint8_t remoteMac[] = {0x3A, 0x33, 0x33, 0x33, 0x33, 0x33};
@@ -52,7 +59,7 @@ struct __attribute__((packed)) DataStruct
 DataStruct tiltData;
 
 // when we booted
-static unsigned long bootTime, wifiTime, mqttTime, sent = 0;
+static unsigned long bootTime, wifiTime, mqttTime, sent, calibrationSetupStart, calibrationWifiStart = 0;
 
 uint32_t calibrationIterations = 0;
 
@@ -179,8 +186,44 @@ static float calculateTilt(float ax, float az, float ay)
 	return sqrt(pitch * pitch + roll * roll);
 }
 
-static bool isCalibrationMode() {
+static bool isCalibrationMode()
+{
 	return (calibrationIterations != 0) ? true : false;
+}
+
+void wifiConnect()
+{
+	WiFi.mode(WIFI_STA);
+	WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+	calibrationWifiStart = millis();
+	while (WiFi.status() != WL_CONNECTED && (millis() - calibrationWifiStart) < WIFI_TIMEOUT)
+	{
+		delay(250);
+		Serial.print(".");
+	}
+
+	Serial.print("\nWiFi connected, IP address: ");
+	Serial.println(WiFi.localIP());
+}
+
+void checkOTAUpdate()
+{
+	wifiConnect();
+
+	t_httpUpdate_return ret = ESPhttpUpdate.update(OTA_SERVER, OTA_PORT, OTA_PATH, versionTimestamp);
+	switch (ret)
+	{
+	case HTTP_UPDATE_FAILED:
+		Serial.println("[OTA] Update failed.");
+		break;
+	case HTTP_UPDATE_NO_UPDATES:
+		Serial.println("[OTA] No update available.");
+		break;
+	case HTTP_UPDATE_OK:
+		Serial.println("[OTA] Update ok."); // may not be called since we reboot the ESP
+		break;
+	}
 }
 
 void setup()
@@ -194,7 +237,7 @@ void setup()
 	Serial.print("Booting because ");
 	Serial.println(ESP.getResetReason());
 
-	Serial.println("Build: " __DATE__ " " __TIME__);
+	Serial.println("Build: " + String(versionTimestamp));
 
 	// INITIALIZE MPU
 	Serial.println("Starting MPU-6050");
@@ -219,27 +262,30 @@ void setup()
 	resetInfo = ESP.getResetInfoPtr();
 	if (resetInfo->reason != REASON_DEEP_SLEEP_AWAKE)
 	{
-		// Wait 30 seconds to allow the user to position the device.
-		delay(30000);
-
-		while (!mpu.getIntDataReadyStatus())
-		{
-			delay(5);
-		}
-
 		int16_t ax, ay, az;
-		mpu.getAcceleration(&ax, &az, &ay);
-		float tilt = calculateTilt(ax, az, ay);
+		float tilt;
 
-		if (tilt < CALIBRATION_TILT_ANGLE)
+		calibrationSetupStart = millis();
+		while ((millis() - calibrationSetupStart) < CALIBRATION_SETUP_TIME)
 		{
-			Serial.println("Initiate calibration mode");
+			mpu.getAcceleration(&ax, &az, &ay);
+			tilt = calculateTilt(ax, az, ay);
+			if (tilt > 0.0 && tilt < CALIBRATION_TILT_ANGLE)
+			{
+				Serial.println("Initiate calibration mode");
 
-			// The only difference between "normal" and "calibration"
-			// is the update frequency. We still deep sleep between samples.
-			sleep_interval = CALIBRATION_INTERVAL;
-			calibrationIterations = 1;
-			ESP.rtcUserMemoryWrite(RTC_ADDRESS, &calibrationIterations, sizeof(calibrationIterations));
+				Serial.println("Checking for OTA update...");
+				checkOTAUpdate();
+
+				// The only difference between "normal" and "calibration"
+				// is the update frequency. We still deep sleep between samples.
+				sleep_interval = CALIBRATION_INTERVAL;
+				calibrationIterations = 1;
+				ESP.rtcUserMemoryWrite(RTC_ADDRESS, &calibrationIterations, sizeof(calibrationIterations));
+
+				break;
+			}
+			delay(2000);
 		}
 	}
 	else if (isCalibrationMode() && calibrationIterations < CALIBRATION_ITERATIONS)
@@ -287,10 +333,10 @@ void loop()
 		mpu.getAcceleration(&ax, &az, &ay);
 
 		float tilt = calculateTilt(ax, az, ay);
-		if (tilt > 0.0)
+		// Ignore zero readings as well as readings of precisely 90.
+		// Both of these indicate failures to read correct data from the MPU.
+		if (tilt > 0.0 && tilt != 90)
 		{
-			// we sometimes get bogus zero initial readings
-			// after a hard boot. Ignore them.
 			samples[nsamples++] = tilt;
 		}
 
