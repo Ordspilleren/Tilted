@@ -31,14 +31,13 @@ ADC_MODE(ADC_VCC);
 #define CALIBRATION_INTERVAL 30
 #define RTC_ADDRESS 0
 #define CALIBRATION_ITERATIONS 60
-#define CALIBRATION_TILT_ANGLE 10
+#define CALIBRATION_TILT_ANGLE_MIN 170
+#define CALIBRATION_TILT_ANGLE_MAX 180
 #define CALIBRATION_SETUP_TIME 30000
 #define WIFI_TIMEOUT 10000
 
-// When the battery cell (default assumes NiMH) gets this low,
-// the ESP switches to every
-// LOW_VOLTAGE_MULTIPLIER*SLEEP_UPDATE_INTERVAL second updates. Hopefully
-// someone is monitoring that stuff and can swap batteries before it really dies.
+// When the battery cell (LiFePO4 in this case) gets this low,
+// the ESP switches to every LOW_VOLTAGE_MULTIPLIER*SLEEP_UPDATE_INTERVAL second updates.
 #define LOW_VOLTAGE_THRESHOLD 3000
 #define LOW_VOLTAGE_MULTIPLIER 4
 
@@ -181,14 +180,34 @@ static void sendSensorData()
 
 static float calculateTilt(float ax, float az, float ay)
 {
-	float pitch = (atan2(ay, sqrt(ax * ax + az * az))) * 180.0 / PI;
-	float roll = (atan2(ax, sqrt(ay * ay + az * az))) * 180.0 / PI;
-	return sqrt(pitch * pitch + roll * roll);
+	return acos(az / (sqrt(ax * ax + ay * ay + az * az))) * 180.0 / PI;
+}
+
+// The only difference between "normal" and "calibration"
+// is the update frequency. We still deep sleep between samples.
+void calibrationMode()
+{
+	readVoltage();
+	sleep_interval = CALIBRATION_INTERVAL;
+	calibrationIterations += 1;
+	ESP.rtcUserMemoryWrite(RTC_ADDRESS, &calibrationIterations, sizeof(calibrationIterations));
 }
 
 static bool isCalibrationMode()
 {
 	return (calibrationIterations != 0) ? true : false;
+}
+
+void normalMode()
+{
+	readVoltage();
+	Serial.println(voltage);
+	bool lowv = !(voltage != 0 && voltage > LOW_VOLTAGE_THRESHOLD);
+	if (lowv)
+	{
+		Serial.println("Voltage below threshold, sleeping longer");
+		sleep_interval *= LOW_VOLTAGE_MULTIPLIER;
+	}
 }
 
 void wifiConnect()
@@ -209,9 +228,10 @@ void wifiConnect()
 
 void checkOTAUpdate()
 {
+	WiFiClient wifiClient;
 	wifiConnect();
 
-	t_httpUpdate_return ret = ESPhttpUpdate.update(OTA_SERVER, OTA_PORT, OTA_PATH, versionTimestamp);
+	t_httpUpdate_return ret = ESPhttpUpdate.update(wifiClient, OTA_SERVER, OTA_PORT, OTA_PATH, versionTimestamp);
 	switch (ret)
 	{
 	case HTTP_UPDATE_FAILED:
@@ -270,18 +290,13 @@ void setup()
 		{
 			mpu.getAcceleration(&ax, &az, &ay);
 			tilt = calculateTilt(ax, az, ay);
-			if (tilt > 0.0 && tilt < CALIBRATION_TILT_ANGLE)
+			if (tilt > 0.0 && tilt > CALIBRATION_TILT_ANGLE_MIN && tilt < CALIBRATION_TILT_ANGLE_MAX)
 			{
-				Serial.println("Initiate calibration mode");
-
 				Serial.println("Checking for OTA update...");
 				checkOTAUpdate();
 
-				// The only difference between "normal" and "calibration"
-				// is the update frequency. We still deep sleep between samples.
-				sleep_interval = CALIBRATION_INTERVAL;
-				calibrationIterations = 1;
-				ESP.rtcUserMemoryWrite(RTC_ADDRESS, &calibrationIterations, sizeof(calibrationIterations));
+				Serial.println("Initiate calibration mode");
+				calibrationMode();
 
 				break;
 			}
@@ -291,23 +306,12 @@ void setup()
 	else if (isCalibrationMode() && calibrationIterations < CALIBRATION_ITERATIONS)
 	{
 		Serial.printf("Calibration mode, %d iterations...", calibrationIterations);
-
-		sleep_interval = CALIBRATION_INTERVAL;
-		calibrationIterations += 1;
-		ESP.rtcUserMemoryWrite(RTC_ADDRESS, &calibrationIterations, sizeof(calibrationIterations));
+		calibrationMode();
 	}
 	else
 	{
 		Serial.println("Normal mode");
-
-		readVoltage();
-		Serial.println(voltage);
-		bool lowv = !(voltage != 0 && voltage > LOW_VOLTAGE_THRESHOLD);
-		if (lowv)
-		{
-			Serial.println("Voltage below threshold, sleeping longer");
-			sleep_interval *= LOW_VOLTAGE_MULTIPLIER;
-		}
+		normalMode();
 	}
 
 	Serial.println("Finished setup");
