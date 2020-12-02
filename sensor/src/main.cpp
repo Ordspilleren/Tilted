@@ -185,11 +185,18 @@ static float calculateTilt(float ax, float az, float ay)
 
 // The only difference between "normal" and "calibration"
 // is the update frequency. We still deep sleep between samples.
-void calibrationMode()
+void calibrationMode(bool firstIteration)
 {
 	readVoltage();
 	sleep_interval = CALIBRATION_INTERVAL;
-	calibrationIterations += 1;
+	if (firstIteration)
+	{
+		calibrationIterations = 1;
+	}
+	else
+	{
+		calibrationIterations += 1;
+	}
 	ESP.rtcUserMemoryWrite(RTC_ADDRESS, &calibrationIterations, sizeof(calibrationIterations));
 }
 
@@ -296,7 +303,7 @@ void setup()
 				checkOTAUpdate();
 
 				Serial.println("Initiate calibration mode");
-				calibrationMode();
+				calibrationMode(true);
 
 				break;
 			}
@@ -306,7 +313,7 @@ void setup()
 	else if (isCalibrationMode() && calibrationIterations < CALIBRATION_ITERATIONS)
 	{
 		Serial.printf("Calibration mode, %d iterations...", calibrationIterations);
-		calibrationMode();
+		calibrationMode(false);
 	}
 	else
 	{

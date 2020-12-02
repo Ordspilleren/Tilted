@@ -3,13 +3,24 @@
 #include <CREDENTIALS.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <DoubleResetDetector.h>
+#include <ESP8266HTTPClient.h>
+#include <tinyexpr.h>
+
+// Number of seconds after reset during which a
+// subseqent reset will be considered a double reset.
+#define DRD_TIMEOUT 10
+
+// RTC Memory Address for the DoubleResetDetector to use
+#define DRD_ADDRESS 0
+
+DoubleResetDetector drd(DRD_TIMEOUT, DRD_ADDRESS);
+
+String deviceName = "TiltedGateway";
 
 #define RETRY_INTERVAL 5000
 
-// Set up static IP and WiFi details
-IPAddress ip(10, 3, 3, 6);
-IPAddress gateway(10, 3, 3, 1);
-IPAddress mask(255, 255, 255, 0);
+// Set up WiFi details
 const char *ssid = WIFI_SSID;
 const char *password = WIFI_PASS;
 
@@ -33,7 +44,24 @@ struct __attribute__((packed)) DataStruct
 
 DataStruct tiltData;
 
+String calibrationPolynomial = "0.9833333333176023-0.000007936506823478075 *tilt + 0.00003095238092931853 *tilt*tilt-1.58730158581862e-7 *tilt*tilt*tilt";
+
+String brewfatherURL = "";
+
+// Toggles for integrations
+bool enableMQTT = true;
+bool enableBrewfather = false;
+
 volatile boolean haveReading = false;
+
+float calculateGravity()
+{
+    String polynomial = calibrationPolynomial;
+    polynomial.replace("tilt", String(tiltData.tilt));
+    polynomial.replace(" ", "");
+
+    return te_interp(polynomial.c_str(), 0);
+}
 
 void receiveCallBackFunction(uint8_t *senderMac, uint8_t *incomingData, uint8_t len)
 {
@@ -72,7 +100,6 @@ void initEspNow()
 void wifiConnect()
 {
     WiFi.mode(WIFI_STA);
-    WiFi.config(ip, gateway, mask);
     WiFi.begin(ssid, password);
 
     while (WiFi.status() != WL_CONNECTED)
@@ -89,12 +116,9 @@ void reconnectMQTT()
 {
     mqttClient.setServer(mqtt_server, 1883);
 
-    String clientId = "Tilted-";
-    clientId += String(random(0xffff), HEX);
-
     while (!mqttClient.connected())
     {
-        if (mqttClient.connect(clientId.c_str()))
+        if (mqttClient.connect(deviceName.c_str()))
         {
             Serial.println("MQTT connected!");
         }
@@ -109,20 +133,6 @@ void reconnectMQTT()
     }
 }
 
-char jsonString[200];
-char* jsonSensorData() {
-    // Serialize data as JSON before sending.
-	StaticJsonDocument<200> doc;
-	doc["tilt"] = tiltData.tilt;
-	doc["temp"] = tiltData.temp;
-	doc["volt"] = tiltData.volt;
-	doc["interval"] = tiltData.interval;
-
-	serializeJson(doc, jsonString);
-
-    return jsonString;
-}
-
 void publishMQTT()
 {
     if (!mqttClient.connected())
@@ -130,23 +140,71 @@ void publishMQTT()
         reconnectMQTT();
     }
 
-    mqttClient.publish(MQTT_TOPIC, jsonSensorData(), true);
+    const size_t capacity = JSON_OBJECT_SIZE(5);
+    DynamicJsonDocument doc(capacity);
+    
+    doc["gravity"] = calculateGravity();
+    doc["tilt"] = tiltData.tilt;
+    doc["temp"] = tiltData.temp;
+    doc["volt"] = tiltData.volt;
+    doc["interval"] = tiltData.interval;
+
+    String jsonString;
+    serializeJson(doc, jsonString);
+
+    mqttClient.publish(MQTT_TOPIC, jsonString.c_str(), true);
     mqttClient.disconnect();
+}
+
+void publishBrewfather()
+{
+    Serial.println("Sending to Brewfather...");
+    const size_t capacity = JSON_OBJECT_SIZE(5);
+    DynamicJsonDocument doc(capacity);
+
+    doc["name"] = deviceName;
+    doc["temp"] = tiltData.temp;
+    doc["temp_unit"] = "C";
+    doc["gravity"] = calculateGravity();
+    doc["gravity_unit"] = "G";
+
+    String jsonBody;
+    serializeJson(doc, jsonBody);
+
+    HTTPClient http;
+    http.begin(wifiClient, brewfatherURL);
+    http.addHeader("Content-Type", "application/json");
+    http.POST(jsonBody);
+    http.end();
 }
 
 void setup()
 {
     Serial.begin(115200);
 
+    if (drd.detectDoubleReset())
+    {
+        Serial.println("Double Reset Detected");
+    }
+
     initEspNow();
 }
 
 void loop()
 {
-    if (haveReading) {
+    drd.loop();
+    if (haveReading)
+    {
         haveReading = false;
         wifiConnect();
-        publishMQTT();
+        if (enableMQTT)
+        {
+            publishMQTT();
+        }
+        if (enableBrewfather)
+        {
+            publishBrewfather();
+        }
         ESP.restart();
     }
 }
