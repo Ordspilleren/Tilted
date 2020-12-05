@@ -6,30 +6,49 @@
 #include <DoubleResetDetector.h>
 #include <ESP8266HTTPClient.h>
 #include <tinyexpr.h>
+#include <IotWebConf.h>
 
 // Number of seconds after reset during which a
 // subseqent reset will be considered a double reset.
-#define DRD_TIMEOUT 10
+#define DRD_TIMEOUT 2
 
 // RTC Memory Address for the DoubleResetDetector to use
 #define DRD_ADDRESS 0
 
 DoubleResetDetector drd(DRD_TIMEOUT, DRD_ADDRESS);
 
-String deviceName = "TiltedGateway";
+const char deviceName[] = "TiltedGateway";
+
+const char wifiInitialApPassword[] = "tilted123";
+
+#define DEFAULT_MQTT_TOPIC "tilted/data"
+
+#define STRING_LEN 128
+
+char polynomial[STRING_LEN];
+char mqttServer[STRING_LEN];
+char mqttTopic[STRING_LEN];
+char brewfatherURL[STRING_LEN];
+
+DNSServer dnsServer;
+WebServer server(80);
+
+IotWebConf iotWebConf(deviceName, &dnsServer, &server, wifiInitialApPassword);
+IotWebConfSeparator separator1 = IotWebConfSeparator("Calibration");
+IotWebConfParameter polynomialParam = IotWebConfParameter("Polynomial", "polynomial", polynomial, STRING_LEN);
+IotWebConfSeparator separator2 = IotWebConfSeparator("MQTT");
+IotWebConfParameter mqttServerParam = IotWebConfParameter("MQTT Server", "mqttserver", mqttServer, STRING_LEN);
+IotWebConfParameter mqttTopicParam = IotWebConfParameter("MQTT Topic", "mqtttopic", mqttTopic, STRING_LEN, "text", NULL, DEFAULT_MQTT_TOPIC);
+IotWebConfSeparator separator3 = IotWebConfSeparator("Other integrations");
+IotWebConfParameter brewfatherURLParam = IotWebConfParameter("Brewfather URL", "brewfatherurl", brewfatherURL, STRING_LEN);
+
+bool configMode = false;
 
 #define RETRY_INTERVAL 5000
 
-// Set up WiFi details
-const char *ssid = WIFI_SSID;
-const char *password = WIFI_PASS;
-
 // MQTT config
-const char *mqtt_server = MQTT_SERVER;
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
-
-#define MQTT_TOPIC "tilted/data"
 
 // the following three settings must match the slave settings
 uint8_t mac[] = {0x3A, 0x33, 0x33, 0x33, 0x33, 0x33};
@@ -44,25 +63,21 @@ struct __attribute__((packed)) DataStruct
 
 DataStruct tiltData;
 
-String calibrationPolynomial = "0.9833333333176023-0.000007936506823478075 *tilt + 0.00003095238092931853 *tilt*tilt-1.58730158581862e-7 *tilt*tilt*tilt";
+//String calibrationPolynomial = "0.9833333333176023-0.000007936506823478075 *tilt + 0.00003095238092931853 *tilt*tilt-1.58730158581862e-7 *tilt*tilt*tilt";
 
-String brewfatherURL = "";
-
-// Toggles for integrations
-bool enableMQTT = true;
-bool enableBrewfather = false;
+//String brewfatherURL = "";
 
 volatile boolean haveReading = false;
 
 float calculateGravity()
 {
-    String polynomial = calibrationPolynomial;
-    polynomial.replace("tilt", String(tiltData.tilt));
-    polynomial.replace(" ", "");
+    String _polynomial = polynomial;
+    _polynomial.replace("tilt", String(tiltData.tilt));
+    _polynomial.replace(" ", "");
 
-    return te_interp(polynomial.c_str(), 0);
+    return round(te_interp(_polynomial.c_str(), 0)*1000)/1000;
 }
-
+ 
 void receiveCallBackFunction(uint8_t *senderMac, uint8_t *incomingData, uint8_t len)
 {
     memcpy(&tiltData, incomingData, len);
@@ -100,7 +115,7 @@ void initEspNow()
 void wifiConnect()
 {
     WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, password);
+    WiFi.begin(iotWebConf.getWifiSsidParameter()->valueBuffer, iotWebConf.getWifiPasswordParameter()->valueBuffer);
 
     while (WiFi.status() != WL_CONNECTED)
     {
@@ -114,11 +129,11 @@ void wifiConnect()
 
 void reconnectMQTT()
 {
-    mqttClient.setServer(mqtt_server, 1883);
+    mqttClient.setServer(mqttServer, 1883);
 
     while (!mqttClient.connected())
     {
-        if (mqttClient.connect(deviceName.c_str()))
+        if (mqttClient.connect(deviceName))
         {
             Serial.println("MQTT connected!");
         }
@@ -142,7 +157,7 @@ void publishMQTT()
 
     const size_t capacity = JSON_OBJECT_SIZE(5);
     DynamicJsonDocument doc(capacity);
-    
+
     doc["gravity"] = calculateGravity();
     doc["tilt"] = tiltData.tilt;
     doc["temp"] = tiltData.temp;
@@ -152,7 +167,7 @@ void publishMQTT()
     String jsonString;
     serializeJson(doc, jsonString);
 
-    mqttClient.publish(MQTT_TOPIC, jsonString.c_str(), true);
+    mqttClient.publish(mqttTopic, jsonString.c_str(), true);
     mqttClient.disconnect();
 }
 
@@ -178,30 +193,81 @@ void publishBrewfather()
     http.end();
 }
 
+bool integrationEnabled(char *integrationVariable) {
+    return (integrationVariable[0] != '\0') ? true : false;
+}
+
+void handleRoot()
+{
+  // -- Let IotWebConf test and handle captive portal requests.
+  if (iotWebConf.handleCaptivePortal())
+  {
+    // -- Captive portal request were already served.
+    return;
+  }
+  String s = "<!DOCTYPE html><html lang=\"en\"><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, user-scalable=no\"/>";
+  s += "<title>IotWebConf 01 Minimal</title></head><body>Hello world!";
+  s += "Go to <a href='config'>configure page</a> to change settings.";
+  s += "</body></html>\n";
+
+  server.send(200, "text/html", s);
+}
+
+void configSaved() {
+    Serial.println("Config has been saved, restarting...");
+    ESP.restart();
+}
+
 void setup()
 {
     Serial.begin(115200);
 
+    iotWebConf.addParameter(&separator1);
+    iotWebConf.addParameter(&polynomialParam);
+    iotWebConf.addParameter(&separator2);
+    iotWebConf.addParameter(&mqttServerParam);
+    iotWebConf.addParameter(&mqttTopicParam);
+    iotWebConf.addParameter(&separator3);
+    iotWebConf.addParameter(&brewfatherURLParam);
+    iotWebConf.setConfigSavedCallback(&configSaved);
+    iotWebConf.forceApMode(true);
+    iotWebConf.init();
+
     if (drd.detectDoubleReset())
     {
         Serial.println("Double Reset Detected");
+        configMode = true;
     }
 
-    initEspNow();
+    if (configMode)
+    {
+        server.on("/", handleRoot);
+        server.on("/config", [] { iotWebConf.handleConfig(); });
+        server.onNotFound([]() { iotWebConf.handleNotFound(); });
+    }
+    else
+    {
+        initEspNow();
+    }
 }
 
 void loop()
 {
     drd.loop();
-    if (haveReading)
+
+    if (configMode) {
+        iotWebConf.doLoop();
+    }
+
+    if (haveReading && !configMode)
     {
         haveReading = false;
         wifiConnect();
-        if (enableMQTT)
+        if (integrationEnabled(mqttServer))
         {
             publishMQTT();
         }
-        if (enableBrewfather)
+        if (integrationEnabled(brewfatherURL))
         {
             publishBrewfather();
         }
