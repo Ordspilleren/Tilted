@@ -17,9 +17,9 @@
 
 DoubleResetDetector drd(DRD_TIMEOUT, DRD_ADDRESS);
 
-const char deviceName[] = "TiltedGateway";
+const char defaultDeviceName[] = "TiltedGateway";
 
-const char wifiInitialApPassword[] = "tilted123";
+const char defaultAPPassword[] = "tilted123";
 
 #define DEFAULT_MQTT_TOPIC "tilted/data"
 
@@ -33,7 +33,7 @@ char brewfatherURL[STRING_LEN];
 DNSServer dnsServer;
 WebServer server(80);
 
-IotWebConf iotWebConf(deviceName, &dnsServer, &server, wifiInitialApPassword);
+IotWebConf iotWebConf(defaultDeviceName, &dnsServer, &server, defaultAPPassword);
 IotWebConfSeparator separator1 = IotWebConfSeparator("Calibration");
 IotWebConfParameter polynomialParam = IotWebConfParameter("Polynomial", "polynomial", polynomial, STRING_LEN);
 IotWebConfSeparator separator2 = IotWebConfSeparator("MQTT");
@@ -62,10 +62,6 @@ struct __attribute__((packed)) DataStruct
 };
 
 DataStruct tiltData;
-
-//String calibrationPolynomial = "0.9833333333176023-0.000007936506823478075 *tilt + 0.00003095238092931853 *tilt*tilt-1.58730158581862e-7 *tilt*tilt*tilt";
-
-//String brewfatherURL = "";
 
 volatile boolean haveReading = false;
 
@@ -133,7 +129,7 @@ void reconnectMQTT()
 
     while (!mqttClient.connected())
     {
-        if (mqttClient.connect(deviceName))
+        if (mqttClient.connect(iotWebConf.getThingName()))
         {
             Serial.println("MQTT connected!");
         }
@@ -177,7 +173,7 @@ void publishBrewfather()
     const size_t capacity = JSON_OBJECT_SIZE(5);
     DynamicJsonDocument doc(capacity);
 
-    doc["name"] = deviceName;
+    doc["name"] = iotWebConf.getThingName();
     doc["temp"] = tiltData.temp;
     doc["temp_unit"] = "C";
     doc["gravity"] = calculateGravity();
@@ -222,6 +218,12 @@ void setup()
 {
     Serial.begin(115200);
 
+    if (drd.detectDoubleReset())
+    {
+        Serial.println("Double Reset Detected");
+        configMode = true;
+    }
+
     iotWebConf.addParameter(&separator1);
     iotWebConf.addParameter(&polynomialParam);
     iotWebConf.addParameter(&separator2);
@@ -233,12 +235,6 @@ void setup()
     iotWebConf.forceApMode(true);
     iotWebConf.init();
 
-    if (drd.detectDoubleReset())
-    {
-        Serial.println("Double Reset Detected");
-        configMode = true;
-    }
-
     if (configMode)
     {
         server.on("/", handleRoot);
@@ -247,6 +243,9 @@ void setup()
     }
     else
     {
+        // Disconnect from AP before initializing ESP-Now.
+        // This is needed because IoTWebConf for some reason sets up the AP with init().
+        WiFi.softAPdisconnect(true);
         initEspNow();
     }
 }
@@ -259,7 +258,7 @@ void loop()
         iotWebConf.doLoop();
     }
 
-    if (haveReading && !configMode)
+    if (haveReading)
     {
         haveReading = false;
         wifiConnect();
