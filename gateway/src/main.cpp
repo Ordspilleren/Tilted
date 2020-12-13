@@ -1,12 +1,12 @@
 #include <ESP8266WiFi.h>
 #include <espnow.h>
-#include <CREDENTIALS.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <DoubleResetDetector.h>
 #include <ESP8266HTTPClient.h>
 #include <tinyexpr.h>
 #include <IotWebConf.h>
+#include <InfluxDbClient.h>
 
 // Number of seconds after reset during which a
 // subseqent reset will be considered a double reset.
@@ -29,6 +29,10 @@ char polynomial[STRING_LEN];
 char mqttServer[STRING_LEN];
 char mqttTopic[STRING_LEN];
 char brewfatherURL[STRING_LEN];
+char influxdbURL[STRING_LEN];
+char influxdbOrg[STRING_LEN];
+char influxdbBucket[STRING_LEN];
+char influxdbToken[STRING_LEN];
 
 DNSServer dnsServer;
 WebServer server(80);
@@ -39,8 +43,13 @@ IotWebConfParameter polynomialParam = IotWebConfParameter("Polynomial", "polynom
 IotWebConfSeparator separator2 = IotWebConfSeparator("MQTT");
 IotWebConfParameter mqttServerParam = IotWebConfParameter("MQTT Server", "mqttserver", mqttServer, STRING_LEN);
 IotWebConfParameter mqttTopicParam = IotWebConfParameter("MQTT Topic", "mqtttopic", mqttTopic, STRING_LEN, "text", NULL, DEFAULT_MQTT_TOPIC);
-IotWebConfSeparator separator3 = IotWebConfSeparator("Other integrations");
+IotWebConfSeparator separator3 = IotWebConfSeparator("Brewfather");
 IotWebConfParameter brewfatherURLParam = IotWebConfParameter("Brewfather URL", "brewfatherurl", brewfatherURL, STRING_LEN);
+IotWebConfSeparator separator4 = IotWebConfSeparator("InfluxDB");
+IotWebConfParameter influxdbURLParam = IotWebConfParameter("InfluxDB URL", "influxdburl", influxdbURL, STRING_LEN);
+IotWebConfParameter influxdbOrgParam = IotWebConfParameter("InfluxDB Org", "influxdborg", influxdbOrg, STRING_LEN);
+IotWebConfParameter influxdbBucketParam = IotWebConfParameter("InfluxDB Bucket", "influxdbbucket", influxdbBucket, STRING_LEN);
+IotWebConfParameter influxdbTokenParam = IotWebConfParameter("InfluxDB Token", "influxdbtoken", influxdbToken, STRING_LEN);
 
 bool configMode = false;
 
@@ -49,6 +58,10 @@ bool configMode = false;
 // MQTT config
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
+
+// InfluxDB
+InfluxDBClient influxClient;
+Point influxDataPoint("tilted_data");
 
 // the following three settings must match the slave settings
 uint8_t mac[] = {0x3A, 0x33, 0x33, 0x33, 0x33, 0x33};
@@ -62,18 +75,37 @@ struct __attribute__((packed)) DataStruct
 };
 
 DataStruct tiltData;
+float tiltGravity = 0;
 
 volatile boolean haveReading = false;
 
+float round3(float value)
+{
+    return (int)(value * 1000 + 0.5) / 1000.0;
+}
+
 float calculateGravity()
 {
-    String _polynomial = polynomial;
-    _polynomial.replace("tilt", String(tiltData.tilt));
-    _polynomial.replace(" ", "");
+    double tilt = tiltData.tilt;
+    double temp = tiltData.temp;
+    float gravity = 0;
+    int err;
+    te_variable vars[] = {{"tilt", &tilt}, {"temp", &temp}};
+    te_expr *expr = te_compile(polynomial, vars, 2, &err);
 
-    return round(te_interp(_polynomial.c_str(), 0)*1000)/1000;
+    if (expr)
+    {
+        gravity = te_eval(expr);
+        te_free(expr);
+    }
+    else
+    {
+        Serial.printf("Could not calculate gravity. Parse error at %d\n", err);
+    }
+
+    return round3(gravity);
 }
- 
+
 void receiveCallBackFunction(uint8_t *senderMac, uint8_t *incomingData, uint8_t len)
 {
     memcpy(&tiltData, incomingData, len);
@@ -154,7 +186,7 @@ void publishMQTT()
     const size_t capacity = JSON_OBJECT_SIZE(5);
     DynamicJsonDocument doc(capacity);
 
-    doc["gravity"] = calculateGravity();
+    doc["gravity"] = tiltGravity;
     doc["tilt"] = tiltData.tilt;
     doc["temp"] = tiltData.temp;
     doc["volt"] = tiltData.volt;
@@ -176,7 +208,7 @@ void publishBrewfather()
     doc["name"] = iotWebConf.getThingName();
     doc["temp"] = tiltData.temp;
     doc["temp_unit"] = "C";
-    doc["gravity"] = calculateGravity();
+    doc["gravity"] = tiltGravity;
     doc["gravity_unit"] = "G";
 
     String jsonBody;
@@ -189,27 +221,47 @@ void publishBrewfather()
     http.end();
 }
 
-bool integrationEnabled(char *integrationVariable) {
+void publishInfluxDB()
+{
+    // Set tags
+    influxDataPoint.addTag("name", iotWebConf.getThingName());
+    // Add data fields
+    influxDataPoint.addField("gravity", tiltGravity, 3);
+    influxDataPoint.addField("tilt", tiltData.tilt);
+    influxDataPoint.addField("temp", tiltData.temp);
+    influxDataPoint.addField("voltage", tiltData.volt);
+    influxDataPoint.addField("interval", tiltData.interval);
+
+    if (!influxClient.writePoint(influxDataPoint))
+    {
+        Serial.print("InfluxDB write failed: ");
+        Serial.println(influxClient.getLastErrorMessage());
+    }
+}
+
+bool integrationEnabled(char *integrationVariable)
+{
     return (integrationVariable[0] != '\0') ? true : false;
 }
 
 void handleRoot()
 {
-  // -- Let IotWebConf test and handle captive portal requests.
-  if (iotWebConf.handleCaptivePortal())
-  {
-    // -- Captive portal request were already served.
-    return;
-  }
-  String s = "<!DOCTYPE html><html lang=\"en\"><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, user-scalable=no\"/>";
-  s += "<title>IotWebConf 01 Minimal</title></head><body>Hello world!";
-  s += "Go to <a href='config'>configure page</a> to change settings.";
-  s += "</body></html>\n";
+    // -- Let IotWebConf test and handle captive portal requests.
+    if (iotWebConf.handleCaptivePortal())
+    {
+        // -- Captive portal request were already served.
+        return;
+    }
+    String s = "<!DOCTYPE html><html lang=\"en\"><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, user-scalable=no\"/>";
+    s += "<title>IotWebConf 01 Minimal</title></head><body>Hello world!";
+    s += "Go to <a href='config'>configure page</a> to change settings.";
+    s += "</body></html>\n";
 
-  server.send(200, "text/html", s);
+    server.send(200, "text/html", s);
 }
 
-void configSaved() {
+void configSaved()
+{
     Serial.println("Config has been saved, restarting...");
     ESP.restart();
 }
@@ -231,6 +283,11 @@ void setup()
     iotWebConf.addParameter(&mqttTopicParam);
     iotWebConf.addParameter(&separator3);
     iotWebConf.addParameter(&brewfatherURLParam);
+    iotWebConf.addParameter(&separator4);
+    iotWebConf.addParameter(&influxdbURLParam);
+    iotWebConf.addParameter(&influxdbOrgParam);
+    iotWebConf.addParameter(&influxdbBucketParam);
+    iotWebConf.addParameter(&influxdbTokenParam);
     iotWebConf.setConfigSavedCallback(&configSaved);
     iotWebConf.forceApMode(true);
     iotWebConf.init();
@@ -254,13 +311,15 @@ void loop()
 {
     drd.loop();
 
-    if (configMode) {
+    if (configMode)
+    {
         iotWebConf.doLoop();
     }
 
     if (haveReading)
     {
         haveReading = false;
+        tiltGravity = calculateGravity();
         wifiConnect();
         if (integrationEnabled(mqttServer))
         {
@@ -269,6 +328,11 @@ void loop()
         if (integrationEnabled(brewfatherURL))
         {
             publishBrewfather();
+        }
+        if (integrationEnabled(influxdbURL))
+        {
+            influxClient.setConnectionParams(influxdbURL, influxdbOrg, influxdbBucket, influxdbToken);
+            publishInfluxDB();
         }
         ESP.restart();
     }
