@@ -8,10 +8,10 @@ The first key difference is in architecture. Instead of connecting the sensor (T
 
 Due to the above approach, a conservative estimate of the battery life, assuming most of the uptime is spent in normal mode, would be somewhere around 1 year!
 
-<p style="text-align: center;">
+<p align="center">
   <img alt="Tilted assembled" src="docs/images/Tilted_assembled.jpg" width="600">
 </p>
-<p style="text-align: center;">
+<p align="center">
   <img alt="PET preform" src="docs/images/PET_preform.jpg" width="600">
 </p>
 
