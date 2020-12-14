@@ -8,11 +8,44 @@ The first key difference is in architecture. Instead of connecting the sensor (T
 
 Due to the above approach, a conservative estimate of the battery life, assuming most of the uptime is spent in normal mode, would be somewhere around 1 year!
 
+<p style="text-align: center;">
+  <img alt="Tilted assembled" src="docs/images/Tilted_assembled.jpg" width="600">
+</p>
+<p style="text-align: center;">
+  <img alt="PET preform" src="docs/images/PET_preform.jpg" width="600">
+</p>
+
+## Features
+* **Long battery life**, more than a year!
+* **Small footprint.**
+* **Flexible positioning** due to the sensor device not connecting directly to WiFi.
+  * Great for aluminum fermentation vessels.
+* **Several integrations:**
+  * Brewfather
+  * MQTT
+  * InfluxDB
+* **Integrations and settings can be updated even when the sensor is in use.**
+  * This is possible because integrations are handled by the gateway device.
+
 ## Usage
 ### Calibration mode
-Calibration mode can be entered by placing the sensor device with the lid facing down. This will enable an update interval of 30 seconds for 30 minutes, allowing the user to calibrate the device.
+Calibration mode can be entered by doing the following:
 
-The above procedure can only be done within 30 seconds from inserting the battery.
+1. Insert the battery into the sensor device.
+2. Within 30 seconds from inserting the battery, place the sensor device with the lid facing down.
+
+This will enable an update interval of 30 seconds for 30 minutes, allowing the user to calibrate the device.
+
+Furthermore, the device will also check for OTA updates. It will do this by trying to connect to the WiFi AP and OTA server defined in the `credentials.h` file.
+
+### 25-degree calibration
+Before using the sensor device, you need to calibrate it such that the tilt value is about 25 degrees in plain water. The 3D printed insert includes a handy way to accomplish this:
+
+1. Cut a piece of filament and insert it into the hole at the bottom of the 3D printed insert.
+2. Put the sensor into calibration mode.
+3. Insert the sensor into the PET preform and put it in plain water. Read the tilt value.
+4. If the tilt value is too high, cut off a bit of filament. Measure again.
+5. Repeat until the tilt value is 25 ± 3.
 
 ## Hardware
 
