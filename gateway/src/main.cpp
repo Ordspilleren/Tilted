@@ -1,21 +1,26 @@
-#include <ESP8266WiFi.h>
-#include <espnow.h>
+#include "WiFi.h"
+#include <esp_wifi.h>
+#include <esp_now.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include <DoubleResetDetector.h>
-#include <ESP8266HTTPClient.h>
+#include <HTTPClient.h>
 #include <tinyexpr.h>
 #include <IotWebConf.h>
 #include <InfluxDbClient.h>
+#include <Button2.h>
+#include <TFT_eSPI.h>
+#include <SPI.h>
 
-// Number of seconds after reset during which a
-// subseqent reset will be considered a double reset.
-#define DRD_TIMEOUT 2
+// Button definitions
+#define BUTTON_1 35
+#define BUTTON_2 0
+Button2 btn1(BUTTON_1);
+Button2 btn2(BUTTON_2);
 
-// RTC Memory Address for the DoubleResetDetector to use
-#define DRD_ADDRESS 0
+// Init display
+TFT_eSPI tft = TFT_eSPI(135, 240);
 
-DoubleResetDetector drd(DRD_TIMEOUT, DRD_ADDRESS);
+#define CONFIG_VERSION "tiltedgw1"
 
 const char defaultDeviceName[] = "TiltedGateway";
 
@@ -37,19 +42,19 @@ char influxdbToken[STRING_LEN];
 DNSServer dnsServer;
 WebServer server(80);
 
-IotWebConf iotWebConf(defaultDeviceName, &dnsServer, &server, defaultAPPassword);
-IotWebConfSeparator separator1 = IotWebConfSeparator("Calibration");
-IotWebConfParameter polynomialParam = IotWebConfParameter("Polynomial", "polynomial", polynomial, STRING_LEN);
-IotWebConfSeparator separator2 = IotWebConfSeparator("MQTT");
-IotWebConfParameter mqttServerParam = IotWebConfParameter("MQTT Server", "mqttserver", mqttServer, STRING_LEN);
-IotWebConfParameter mqttTopicParam = IotWebConfParameter("MQTT Topic", "mqtttopic", mqttTopic, STRING_LEN, "text", NULL, DEFAULT_MQTT_TOPIC);
-IotWebConfSeparator separator3 = IotWebConfSeparator("Brewfather");
-IotWebConfParameter brewfatherURLParam = IotWebConfParameter("Brewfather URL", "brewfatherurl", brewfatherURL, STRING_LEN);
-IotWebConfSeparator separator4 = IotWebConfSeparator("InfluxDB");
-IotWebConfParameter influxdbURLParam = IotWebConfParameter("InfluxDB URL", "influxdburl", influxdbURL, STRING_LEN);
-IotWebConfParameter influxdbOrgParam = IotWebConfParameter("InfluxDB Org", "influxdborg", influxdbOrg, STRING_LEN);
-IotWebConfParameter influxdbBucketParam = IotWebConfParameter("InfluxDB Bucket", "influxdbbucket", influxdbBucket, STRING_LEN);
-IotWebConfParameter influxdbTokenParam = IotWebConfParameter("InfluxDB Token", "influxdbtoken", influxdbToken, STRING_LEN);
+IotWebConf iotWebConf(defaultDeviceName, &dnsServer, &server, defaultAPPassword, CONFIG_VERSION);
+iotwebconf::ParameterGroup calibrationGroup = iotwebconf::ParameterGroup("Calibration", "");
+iotwebconf::TextParameter polynomialParam = iotwebconf::TextParameter("Polynomial", "polynomial", polynomial, STRING_LEN);
+iotwebconf::ParameterGroup mqttGroup = iotwebconf::ParameterGroup("MQTT", "");
+iotwebconf::TextParameter mqttServerParam = iotwebconf::TextParameter("MQTT Server", "mqttserver", mqttServer, STRING_LEN);
+iotwebconf::TextParameter mqttTopicParam = iotwebconf::TextParameter("MQTT Topic", "mqtttopic", mqttTopic, STRING_LEN, "text", NULL, DEFAULT_MQTT_TOPIC);
+iotwebconf::ParameterGroup brewfatherGroup = iotwebconf::ParameterGroup("Brewfather", "");
+iotwebconf::TextParameter brewfatherURLParam = iotwebconf::TextParameter("Brewfather URL", "brewfatherurl", brewfatherURL, STRING_LEN);
+iotwebconf::ParameterGroup influxdbGroup = iotwebconf::ParameterGroup("InfluxDB", "");
+iotwebconf::TextParameter influxdbURLParam = iotwebconf::TextParameter("InfluxDB URL", "influxdburl", influxdbURL, STRING_LEN);
+iotwebconf::TextParameter influxdbOrgParam = iotwebconf::TextParameter("InfluxDB Org", "influxdborg", influxdbOrg, STRING_LEN);
+iotwebconf::TextParameter influxdbBucketParam = iotwebconf::TextParameter("InfluxDB Bucket", "influxdbbucket", influxdbBucket, STRING_LEN);
+iotwebconf::TextParameter influxdbTokenParam = iotwebconf::TextParameter("InfluxDB Token", "influxdbtoken", influxdbToken, STRING_LEN);
 
 bool configMode = false;
 
@@ -65,7 +70,7 @@ Point influxDataPoint("tilted_data");
 
 // the following three settings must match the slave settings
 uint8_t mac[] = {0x3A, 0x33, 0x33, 0x33, 0x33, 0x33};
-const uint8_t channel = 11;
+const uint8_t channel = 1;
 struct __attribute__((packed)) DataStruct
 {
     float tilt;
@@ -106,7 +111,7 @@ float calculateGravity()
     return round3(gravity);
 }
 
-void receiveCallBackFunction(uint8_t *senderMac, uint8_t *incomingData, uint8_t len)
+void receiveCallBackFunction(const uint8_t *senderMac, const uint8_t *incomingData, int len)
 {
     memcpy(&tiltData, incomingData, len);
     Serial.printf("Transmitter MacAddr: %02x:%02x:%02x:%02x:%02x:%02x, ", senderMac[0], senderMac[1], senderMac[2], senderMac[3], senderMac[4], senderMac[5]);
@@ -120,22 +125,25 @@ void receiveCallBackFunction(uint8_t *senderMac, uint8_t *incomingData, uint8_t 
 
 void initEspNow()
 {
-    WiFi.mode(WIFI_AP);
-    wifi_set_macaddr(SOFTAP_IF, &mac[0]);
-    wifi_set_channel(channel);
+    WiFi.softAPdisconnect(true);
     WiFi.disconnect();
+    WiFi.mode(WIFI_STA);
+    esp_wifi_set_mac(WIFI_IF_STA, &mac[0]);
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
 
     Serial.println();
     Serial.println("ESP-Now Receiver");
     Serial.printf("Transmitter mac: %s\n", WiFi.macAddress().c_str());
     Serial.printf("Receiver mac: %s\n", WiFi.softAPmacAddress().c_str());
-    if (esp_now_init() != 0)
+    if (esp_now_init() != ESP_OK)
     {
         Serial.println("ESP_Now init failed...");
         delay(RETRY_INTERVAL);
         ESP.restart();
     }
-    esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
+    Serial.println(WiFi.channel());
     esp_now_register_recv_cb(receiveCallBackFunction);
     Serial.println("Slave ready. Waiting for messages...");
 }
@@ -266,50 +274,66 @@ void configSaved()
     ESP.restart();
 }
 
+void button1Pressed(Button2 &btn)
+{
+    Serial.println("Button pressed, going into config mode...");
+    configMode = true;
+    server.on("/", handleRoot);
+    server.on("/config", [] { iotWebConf.handleConfig(); });
+    server.onNotFound([]() { iotWebConf.handleNotFound(); });
+    iotWebConf.setConfigSavedCallback(&configSaved);
+    iotWebConf.init();
+    iotWebConf.forceApMode(true);
+}
+
+void screenDrawVariables(float gravity, float temp) {
+    int xpos = 0;
+    int ypos = 0;
+    xpos += tft.drawString("T: ", xpos, ypos, 4);
+    xpos += tft.drawFloat(gravity, 3, xpos, ypos, 4);
+    xpos += 4;
+    tft.drawFastVLine(xpos, ypos, 20, TFT_PINK);
+    xpos += 4;
+    xpos += tft.drawString("T: ", xpos, ypos, 4);
+    xpos += tft.drawFloat(temp, 2, xpos, ypos, 4);
+}
+
 void setup()
 {
     Serial.begin(115200);
 
-    if (drd.detectDoubleReset())
-    {
-        Serial.println("Double Reset Detected");
-        configMode = true;
-    }
+    btn1.setTapHandler(button1Pressed);
 
-    iotWebConf.addParameter(&separator1);
-    iotWebConf.addParameter(&polynomialParam);
-    iotWebConf.addParameter(&separator2);
-    iotWebConf.addParameter(&mqttServerParam);
-    iotWebConf.addParameter(&mqttTopicParam);
-    iotWebConf.addParameter(&separator3);
-    iotWebConf.addParameter(&brewfatherURLParam);
-    iotWebConf.addParameter(&separator4);
-    iotWebConf.addParameter(&influxdbURLParam);
-    iotWebConf.addParameter(&influxdbOrgParam);
-    iotWebConf.addParameter(&influxdbBucketParam);
-    iotWebConf.addParameter(&influxdbTokenParam);
-    iotWebConf.setConfigSavedCallback(&configSaved);
-    iotWebConf.forceApMode(true);
-    iotWebConf.init();
+    calibrationGroup.addItem(&polynomialParam);
+    mqttGroup.addItem(&mqttServerParam);
+    mqttGroup.addItem(&mqttTopicParam);
+    brewfatherGroup.addItem(&brewfatherURLParam);
+    influxdbGroup.addItem(&influxdbURLParam);
+    influxdbGroup.addItem(&influxdbOrgParam);
+    influxdbGroup.addItem(&influxdbBucketParam);
+    influxdbGroup.addItem(&influxdbTokenParam);
 
-    if (configMode)
-    {
-        server.on("/", handleRoot);
-        server.on("/config", [] { iotWebConf.handleConfig(); });
-        server.onNotFound([]() { iotWebConf.handleNotFound(); });
-    }
-    else
-    {
-        // Disconnect from AP before initializing ESP-Now.
-        // This is needed because IoTWebConf for some reason sets up the AP with init().
-        WiFi.softAPdisconnect(true);
-        initEspNow();
-    }
+    iotWebConf.addParameterGroup(&calibrationGroup);
+    iotWebConf.addParameterGroup(&mqttGroup);
+    iotWebConf.addParameterGroup(&brewfatherGroup);
+    iotWebConf.addParameterGroup(&influxdbGroup);
+
+    iotWebConf.loadConfig();
+
+    // Disconnect from AP before initializing ESP-Now.
+    // This is needed because IoTWebConf for some reason sets up the AP with init().
+    //WiFi.softAPdisconnect(true);
+    initEspNow();
+
+    tft.init();
+    tft.fontHeight(2);
+    tft.setRotation(1);
+    tft.fillScreen(TFT_BLACK);
 }
 
 void loop()
 {
-    drd.loop();
+    btn1.loop();
 
     if (configMode)
     {
@@ -320,6 +344,7 @@ void loop()
     {
         haveReading = false;
         tiltGravity = calculateGravity();
+        screenDrawVariables(tiltData.tilt, tiltData.temp);
         wifiConnect();
         if (integrationEnabled(mqttServer))
         {
@@ -334,6 +359,6 @@ void loop()
             influxClient.setConnectionParams(influxdbURL, influxdbOrg, influxdbBucket, influxdbToken);
             publishInfluxDB();
         }
-        ESP.restart();
+        initEspNow();
     }
 }

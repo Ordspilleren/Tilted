@@ -46,7 +46,7 @@ const char versionTimestamp[] = "TiltedSensor " __DATE__ " " __TIME__;
 
 // the following three settings must match the slave settings
 uint8_t remoteMac[] = {0x3A, 0x33, 0x33, 0x33, 0x33, 0x33};
-const uint8_t channel = 11;
+const uint8_t channel = 1;
 struct __attribute__((packed)) DataStruct
 {
 	float tilt;
