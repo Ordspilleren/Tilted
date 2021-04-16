@@ -10,6 +10,7 @@
 #include <Button2.h>
 #include <TFT_eSPI.h>
 #include <SPI.h>
+#include <CircularBuffer.h>
 
 // Button definitions
 #define BUTTON_1 35
@@ -286,16 +287,125 @@ void button1Pressed(Button2 &btn)
     iotWebConf.forceApMode(true);
 }
 
-void screenDrawVariables(float gravity, float temp) {
-    int xpos = 0;
-    int ypos = 0;
-    xpos += tft.drawString("T: ", xpos, ypos, 4);
-    xpos += tft.drawFloat(gravity, 3, xpos, ypos, 4);
-    xpos += 4;
-    tft.drawFastVLine(xpos, ypos, 20, TFT_PINK);
-    xpos += 4;
-    xpos += tft.drawString("T: ", xpos, ypos, 4);
-    xpos += tft.drawFloat(temp, 2, xpos, ypos, 4);
+void screenUpdateVariables(float gravity, float temp)
+{
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextPadding(tft.textWidth("11.000", 4));
+    tft.drawString((String)gravity, tft.width() / 2, tft.height() / 2 + 60, 4);
+    tft.drawString((String)temp, tft.width() / 2, tft.height() / 2 + 100, 4);
+    tft.setTextPadding(0);
+}
+
+bool display1 = true;
+bool update1 = true;
+
+double ox = -999, oy = -999; // Force them to be off screen
+
+void Trace(TFT_eSPI &tft, double x, double y,
+           double gx, double gy,
+           double w, double h,
+           double xlo, double xhi,
+           double ylo, double yhi,
+           bool &update1, unsigned int color)
+{
+
+    //unsigned int gcolor = DKBLUE;   // gcolor = graph grid color
+    unsigned int pcolor = color; // pcolor = color of your plotted data
+
+    // initialize old x and old y in order to draw the first point of the graph
+    // but save the transformed value
+    // note my transform funcition is the same as the map function, except the map uses long and we need doubles
+    if (update1)
+    {
+        update1 = false;
+
+        ox = (x - xlo) * (w) / (xhi - xlo) + gx;
+        oy = (y - ylo) * (gy - h - gy) / (yhi - ylo) + gy;
+
+        if ((ox < gx) || (ox > gx + w))
+        {
+            update1 = true;
+            return;
+        }
+        if ((oy < gy - h) || (oy > gy))
+        {
+            update1 = true;
+            return;
+        }
+
+        tft.setTextDatum(MR_DATUM);
+    }
+
+    // the coordinates are now drawn, plot the data
+    // the entire plotting code are these few lines...
+    // recall that ox and oy are initialized above
+    x = (x - xlo) * (w) / (xhi - xlo) + gx;
+    y = (y - ylo) * (gy - h - gy) / (yhi - ylo) + gy;
+
+    if ((x < gx) || (x > gx + w))
+    {
+        update1 = true;
+        return;
+    }
+    if ((y < gy - h) || (y > gy))
+    {
+        update1 = true;
+        return;
+    }
+
+    tft.drawLine(ox, oy, x, y, pcolor);
+    // it's up to you but drawing 2 more lines to give the graph some thickness
+    tft.drawLine(ox, oy + 1, x, y + 1, pcolor);
+    tft.drawLine(ox, oy - 1, x, y - 1, pcolor);
+    ox = x;
+    oy = y;
+}
+
+CircularBuffer<float, 24> readings;
+void drawGraph()
+{
+    if (readings.size() < 2)
+    {
+        return;
+    }
+
+    tft.fillRect(0, 0, tft.width(), tft.height() / 2, TFT_BLACK);
+
+    // Draw rectangle around graph
+    tft.drawRect(0, 0, tft.width(), tft.height() / 2, TFT_WHITE);
+
+    float minValue = readings[0];
+    float maxValue = 0;
+
+    for (int i = 0; i < readings.size(); i++)
+    {
+        if (readings[i] > maxValue)
+        {
+            maxValue = readings[i];
+        }
+        if (readings[i] < minValue)
+        {
+            minValue = readings[i];
+        }
+    }
+    Serial.printf("Min: %f, Max: %f", minValue, maxValue);
+
+    double x, y;
+    update1 = true;
+    for (int i = 0; i < readings.size(); i++)
+    {
+        x = i + 1;
+        y = readings[i];
+        Trace(tft, x, y, 0, tft.height() / 2 - 10, tft.width(), tft.height() / 2 - 10, 1, readings.size(), minValue, maxValue, update1, TFT_YELLOW);
+        Serial.printf("Update %f", x);
+    }
+
+    tft.setTextPadding(tft.textWidth("11.000", 2));
+    tft.setTextDatum(ML_DATUM);
+    tft.drawFloat(readings.first(), 3, 0, tft.height() / 2 + 10, 2);
+    tft.setTextDatum(MR_DATUM);
+    tft.drawFloat(readings.last(), 3, tft.width(), tft.height() / 2 + 10, 2);
+    tft.setTextPadding(0);
 }
 
 void setup()
@@ -326,9 +436,12 @@ void setup()
     initEspNow();
 
     tft.init();
-    tft.fontHeight(2);
-    tft.setRotation(1);
+    tft.setRotation(0);
     tft.fillScreen(TFT_BLACK);
+
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString("Gravity", 0, tft.height() / 2 + 45, 2);
+    tft.drawString("Temperature", 0, tft.height() / 2 + 85, 2);
 }
 
 void loop()
@@ -344,7 +457,9 @@ void loop()
     {
         haveReading = false;
         tiltGravity = calculateGravity();
-        screenDrawVariables(tiltData.tilt, tiltData.temp);
+        screenUpdateVariables(tiltData.tilt, tiltData.temp);
+        readings.push(tiltData.tilt);
+        drawGraph();
         wifiConnect();
         if (integrationEnabled(mqttServer))
         {

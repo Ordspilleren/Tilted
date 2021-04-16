@@ -6,5 +6,10 @@
 		{
 			"path": "gateway"
 		}
-	]
+	],
+	"settings": {
+		"files.associations": {
+			"*.tpp": "cpp"
+		}
+	}
 }
