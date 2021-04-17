@@ -83,6 +83,10 @@ struct __attribute__((packed)) DataStruct
 DataStruct tiltData;
 float tiltGravity = 0;
 
+// Buffer with readings for graph display.
+// Can be either tilt value or gravity.
+CircularBuffer<float, 24> readingsHistory;
+
 volatile boolean haveReading = false;
 
 float round3(float value)
@@ -296,16 +300,12 @@ void screenUpdateVariables(float gravity, float temp)
     tft.setTextPadding(0);
 }
 
-bool display1 = true;
-bool update1 = true;
-
-double ox = -999, oy = -999; // Force them to be off screen
-
 void Trace(TFT_eSPI &tft, double x, double y,
            double gx, double gy,
            double w, double h,
            double xlo, double xhi,
            double ylo, double yhi,
+           double &ox, double &oy,
            bool &update1, unsigned int color)
 {
 
@@ -361,51 +361,72 @@ void Trace(TFT_eSPI &tft, double x, double y,
     oy = y;
 }
 
-CircularBuffer<float, 24> readings;
 void drawGraph()
 {
-    if (readings.size() < 2)
+    // No point in drawing the graph if we don't have at least two readings.
+    if (readingsHistory.size() < 2)
     {
         return;
     }
 
+    // Clear graph before update.
     tft.fillRect(0, 0, tft.width(), tft.height() / 2, TFT_BLACK);
 
     // Draw rectangle around graph
     tft.drawRect(0, 0, tft.width(), tft.height() / 2, TFT_WHITE);
 
-    float minValue = readings[0];
+    float minValue = readingsHistory[0];
     float maxValue = 0;
 
-    for (int i = 0; i < readings.size(); i++)
+    for (int i = 0; i < readingsHistory.size(); i++)
     {
-        if (readings[i] > maxValue)
+        if (readingsHistory[i] > maxValue)
         {
-            maxValue = readings[i];
+            maxValue = readingsHistory[i];
         }
-        if (readings[i] < minValue)
+        if (readingsHistory[i] < minValue)
         {
-            minValue = readings[i];
+            minValue = readingsHistory[i];
         }
     }
     Serial.printf("Min: %f, Max: %f", minValue, maxValue);
 
     double x, y;
-    update1 = true;
-    for (int i = 0; i < readings.size(); i++)
+    bool update1 = true;
+    double ox = -999, oy = -999; // Force them to be off screen
+    for (int i = 0; i < readingsHistory.size(); i++)
     {
         x = i + 1;
-        y = readings[i];
-        Trace(tft, x, y, 0, tft.height() / 2 - 10, tft.width(), tft.height() / 2 - 10, 1, readings.size(), minValue, maxValue, update1, TFT_YELLOW);
+        y = readingsHistory[i];
+        Trace(tft, x, y, 0, tft.height() / 2 - 10, tft.width(), tft.height() / 2 - 20, 1, readingsHistory.size(), minValue, maxValue, ox, oy, update1, TFT_YELLOW);
         Serial.printf("Update %f", x);
     }
 
-    tft.setTextPadding(tft.textWidth("11.000", 2));
+    tft.setTextPadding(tft.textWidth("111.000", 2));
     tft.setTextDatum(ML_DATUM);
-    tft.drawFloat(readings.first(), 3, 0, tft.height() / 2 + 10, 2);
+    tft.drawFloat(readingsHistory.first(), 3, 0, tft.height() / 2 + 10, 2);
     tft.setTextDatum(MR_DATUM);
-    tft.drawFloat(readings.last(), 3, tft.width(), tft.height() / 2 + 10, 2);
+    tft.drawFloat(readingsHistory.last(), 3, tft.width(), tft.height() / 2 + 10, 2);
     tft.setTextPadding(0);
+}
+
+void prepareScreen()
+{
+    tft.init();
+    tft.setRotation(0);
+    tft.fillScreen(TFT_BLACK);
+
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString("Gravity", 0, tft.height() / 2 + 45, 2);
+    tft.drawString("Temperature", 0, tft.height() / 2 + 85, 2);
+
+    // Draw rectangle around graph
+    tft.drawRect(0, 0, tft.width(), tft.height() / 2, TFT_WHITE);
+}
+
+void saveReading(float reading)
+{
+    readingsHistory.push(reading);
 }
 
 void setup()
@@ -435,13 +456,7 @@ void setup()
     //WiFi.softAPdisconnect(true);
     initEspNow();
 
-    tft.init();
-    tft.setRotation(0);
-    tft.fillScreen(TFT_BLACK);
-
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString("Gravity", 0, tft.height() / 2 + 45, 2);
-    tft.drawString("Temperature", 0, tft.height() / 2 + 85, 2);
+    prepareScreen();
 }
 
 void loop()
@@ -458,7 +473,7 @@ void loop()
         haveReading = false;
         tiltGravity = calculateGravity();
         screenUpdateVariables(tiltData.tilt, tiltData.temp);
-        readings.push(tiltData.tilt);
+        saveReading(tiltData.tilt);
         drawGraph();
         wifiConnect();
         if (integrationEnabled(mqttServer))
