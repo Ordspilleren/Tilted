@@ -180,6 +180,9 @@ static void sendSensorData()
 
 static float calculateTilt(float ax, float az, float ay)
 {
+	if (ax == 0 && ay == 0 && az == 0)
+		return 0.f;
+
 	return acos(az / (sqrt(ax * ax + ay * ay + az * az))) * 180.0 / PI;
 }
 
