@@ -9,6 +9,9 @@ The first key difference is in architecture. Instead of connecting the sensor (T
 Due to the above approach, a conservative estimate of the battery life, assuming most of the uptime is spent in normal mode, would be somewhere around 1 year!
 
 <p align="center">
+  <img alt="Gateway" src="docs/images/Gateway.jpg" width="600">
+</p>
+<p align="center">
   <img alt="Tilted assembled" src="docs/images/Tilted_assembled.jpg" width="600">
 </p>
 <p align="center">
@@ -66,7 +69,8 @@ For the sensor device itself, the following parts are needed:
 * 3D printed sled
 
 For the gateway device, you will need these parts:
-* Wemos D1
+* TTGO T-Display
+  * This is a custom ESP32 board with a TFT display. Can be purchased on Aliexpress.
 * 3D printed case
 
 ### Wiring the ESP-12
@@ -87,4 +91,5 @@ IO4 --> MPU SDA
 IO5 --> MPU SCL
 
 ## Credits
-[weeSpindel](https://github.com/c-/weeSpindel): I took heavy inspiration from the code, but also the approach as a whole.
+* [weeSpindel](https://github.com/c-/weeSpindel): I took heavy inspiration from the code, but also the approach as a whole.
+* [TTGO T-Display Case](https://www.thingiverse.com/thing:4501444)
