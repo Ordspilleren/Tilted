@@ -2,8 +2,7 @@
 #include <ESP8266httpUpdate.h>
 #include <espnow.h>
 #include <Wire.h>
-#include "I2Cdev.h"
-#include "MPU6050_6Axis_MotionApps20.h"
+#include "MPU6050.h"
 #include "credentials.h"
 
 // Set ADC mode for voltage reading.
@@ -81,7 +80,7 @@ static const int led = LED_BUILTIN;
 static inline void ledOn()
 {
 	// reduce the brightness a whole bunch
-	analogWrite(led, PWMRANGE - 20);
+	analogWrite(led, 1023 - 20);
 }
 static inline void ledOff()
 {
