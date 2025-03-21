@@ -43,6 +43,9 @@ ADC_MODE(ADC_VCC);
 // Version identifier for OTA.
 const char versionTimestamp[] = "TiltedSensor " __DATE__ " " __TIME__;
 
+// Low-pass filter coefficient (0 = no filtering, 1 = ignore new readings)
+#define FILTER_ALPHA 0.2
+
 // the following three settings must match the slave settings
 uint8_t remoteMac[] = {0x3A, 0x33, 0x33, 0x33, 0x33, 0x33};
 const uint8_t channel = 1;
@@ -60,6 +63,17 @@ DataStruct tiltData;
 static unsigned long bootTime, wifiTime, mqttTime, sent, calibrationSetupStart, calibrationWifiStart = 0;
 
 uint32_t calibrationIterations = 0;
+
+// Sensor state variables
+enum SensorState {
+    STATE_INIT,
+    STATE_SAMPLING,
+    STATE_PROCESSING,
+    STATE_TRANSMITTING,
+    STATE_SLEEPING
+};
+
+SensorState currentState = STATE_INIT;
 
 RF_PRE_INIT()
 {
@@ -79,52 +93,97 @@ static const int led = LED_BUILTIN;
 
 static inline void ledOn()
 {
-	// reduce the brightness a whole bunch
-	analogWrite(led, 1023 - 20);
+	digitalWrite(led, LOW);
 }
 static inline void ledOff()
 {
-	analogWrite(led, 0);
 	digitalWrite(led, HIGH);
 }
 
 //-----------------------------------------------------------------
 static void putMpuToSleep()
 {
-	static int slept = 0;
-	if (slept == 0)
-	{
-		mpu.setSleepEnabled(true);
-	}
-	slept = 1;
+	mpu.setSleepEnabled(true);
+    Serial.println("MPU put to sleep");
+}
+
+// Calculate tilt angle from accelerometer readings
+static float calculateTilt(float ax, float az, float ay)
+{
+	if (ax == 0 && ay == 0 && az == 0)
+		return 0.f;
+
+	return acos(az / (sqrt(ax * ax + ay * ay + az * az))) * 180.0 / PI;
+}
+
+// Apply median filter to remove outliers
+static float medianFilter(float values[], int size)
+{
+    // Create a copy of the array for sorting
+    float temp[size];
+    for (int i = 0; i < size; i++) {
+        temp[i] = values[i];
+    }
+    
+    // Simple bubble sort
+    for (int i = 0; i < size - 1; i++) {
+        for (int j = 0; j < size - i - 1; j++) {
+            if (temp[j] > temp[j + 1]) {
+                float swap = temp[j];
+                temp[j] = temp[j + 1];
+                temp[j + 1] = swap;
+            }
+        }
+    }
+    
+    // Return middle value for odd-sized array
+    if (size % 2 == 1) {
+        return temp[size / 2];
+    } 
+    // Return average of two middle values for even-sized array
+    else {
+        return (temp[size / 2 - 1] + temp[size / 2]) / 2.0;
+    }
 }
 
 static void actuallySleep()
 {
-	// If we haven't already done this...
-	putMpuToSleep();
+    // Put MPU to sleep if not already done
+    putMpuToSleep();
+    
+    // Turn off WiFi completely to save power
+    WiFi.mode(WIFI_OFF);
+    WiFi.forceSleepBegin();
+    delay(1); // Give WiFi time to shut down
 
-	double uptime = (millis() - bootTime) / 1000.;
+    double uptime = (millis() - bootTime) / 1000.;
 
-	long willsleep = sleep_interval - uptime;
-	if (willsleep <= sleep_interval / 2)
-	{
-		// If we somehow ended up awake longer than half a sleep interval,
-		// sleep longer. This shouldn't happen in practice.
-		willsleep = sleep_interval;
-	}
-	Serial.printf("bootTime: %ld WifiTime: %ld mqttTime: %ld\n", bootTime, wifiTime, mqttTime);
-	Serial.printf("Deep sleeping %ld seconds after %.3g awake\n", willsleep, uptime);
+    long willsleep = sleep_interval - uptime;
+    if (willsleep <= sleep_interval / 2)
+    {
+        // If we somehow ended up awake longer than half a sleep interval,
+        // sleep longer. This shouldn't happen in practice.
+        willsleep = sleep_interval;
+    }
+    Serial.printf("bootTime: %ld WifiTime: %ld mqttTime: %ld\n", bootTime, wifiTime, mqttTime);
+    Serial.printf("Deep sleeping %ld seconds after %.3g awake\n", willsleep, uptime);
 
-	ESP.deepSleepInstant(willsleep * 1000000, WAKE_NO_RFCAL);
+    ESP.deepSleepInstant(willsleep * 1000000, WAKE_NO_RFCAL);
 }
 
 //-----------------------------------------------------------------
 static int voltage = 0;
 
-static inline double readVoltage()
+static inline int readVoltage()
 {
-	return (voltage = ESP.getVcc());
+    // Read voltage multiple times and average for better accuracy
+    const int readings = 3;
+    int sum = 0;
+    for (int i = 0; i < readings; i++) {
+        sum += ESP.getVcc();
+        delay(5);
+    }
+    return (voltage = sum / readings);
 }
 
 //--------------------------------------------------------------
@@ -139,50 +198,56 @@ float round1(float value)
 
 static void sendSensorData()
 {
-	Serial.println("Sending data...");
+    Serial.println("Processing and sending data...");
 
-	// calculate average. Median might
-	// throw away initial "bad" readings.
-	double sum = 0;
-	for (unsigned int i = 0; i < nsamples; i++)
-	{
-		sum += samples[i];
-	}
+    // Apply median filter to samples to remove outliers
+    float filteredValue = medianFilter(samples, nsamples);
+    
+    tiltData.tilt = round1(filteredValue);
+    tiltData.temp = round1(temperature);
+    tiltData.volt = voltage;
+    tiltData.interval = sleep_interval;
 
-	tiltData.tilt = round1(sum / nsamples);
-	tiltData.temp = round1(temperature);
-	tiltData.volt = voltage;
-	tiltData.interval = sleep_interval;
+    // Initialize WiFi in STA mode
+    WiFi.forceSleepWake();
+    delay(1);
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
 
-	WiFi.mode(WIFI_STA);
-	WiFi.disconnect();
+    unsigned long espnow_start = millis();
+    unsigned long timeout = WAKE_TIMEOUT / 2;  // Shorter timeout for ESP-NOW
+    
+    bool init_success = false;
+    while ((millis() - espnow_start) < timeout) {
+        if (esp_now_init() == 0) {
+            init_success = true;
+            break;
+        }
+        delay(10);
+    }
+    
+    if (!init_success) {
+        Serial.println("ESP-NOW init failed, sleeping without sending data");
+        actuallySleep();
+        return;
+    }
 
-	while (esp_now_init() != 0 && (millis() - bootTime) < WAKE_TIMEOUT)
-	{
-		delay(5);
-	}
+    esp_now_set_self_role(ESP_NOW_ROLE_CONTROLLER);
+    esp_now_add_peer(remoteMac, ESP_NOW_ROLE_SLAVE, channel, NULL, 0);
 
-	esp_now_set_self_role(ESP_NOW_ROLE_CONTROLLER);
-	esp_now_add_peer(remoteMac, ESP_NOW_ROLE_SLAVE, channel, NULL, 0);
-	//esp_now_register_send_cb(sendCallBackFunction);
+    wifiTime = millis();
 
-	wifiTime = millis();
+    uint8_t bs[sizeof(tiltData)];
+    memcpy(bs, &tiltData, sizeof(tiltData));
 
-	uint8_t bs[sizeof(tiltData)];
-	memcpy(bs, &tiltData, sizeof(tiltData));
-
-	esp_now_send(NULL, bs, sizeof(tiltData)); // NULL means send to all peers
-	sent = millis();
-
-	mqttTime = millis();
-}
-
-static float calculateTilt(float ax, float az, float ay)
-{
-	if (ax == 0 && ay == 0 && az == 0)
-		return 0.f;
-
-	return acos(az / (sqrt(ax * ax + ay * ay + az * az))) * 180.0 / PI;
+    esp_now_send(NULL, bs, sizeof(tiltData)); // NULL means send to all peers
+    sent = millis();
+    mqttTime = millis();
+    
+    Serial.println("Data sent, preparing to sleep");
+    
+    // Clean up ESP-NOW to save power
+    esp_now_deinit();
 }
 
 // The only difference between "normal" and "calibration"
@@ -221,18 +286,20 @@ void normalMode()
 
 void wifiConnect()
 {
-	WiFi.mode(WIFI_STA);
-	WiFi.begin(WIFI_SSID, WIFI_PASS);
+    WiFi.forceSleepWake();
+    delay(1);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-	calibrationWifiStart = millis();
-	while (WiFi.status() != WL_CONNECTED && (millis() - calibrationWifiStart) < WIFI_TIMEOUT)
-	{
-		delay(250);
-		Serial.print(".");
-	}
+    calibrationWifiStart = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - calibrationWifiStart) < WIFI_TIMEOUT)
+    {
+        delay(250);
+        Serial.print(".");
+    }
 
-	Serial.print("\nWiFi connected, IP address: ");
-	Serial.println(WiFi.localIP());
+    Serial.print("\nWiFi connected, IP address: ");
+    Serial.println(WiFi.localIP());
 }
 
 void checkOTAUpdate()
@@ -267,6 +334,10 @@ void setup()
 	Serial.println(ESP.getResetReason());
 
 	Serial.println("Build: " + String(versionTimestamp));
+
+	// Turn off WiFi by default to save power
+	WiFi.mode(WIFI_OFF);
+	WiFi.forceSleepBegin();
 
 	// INITIALIZE MPU
 	Serial.println("Starting MPU-6050");
@@ -323,55 +394,70 @@ void setup()
 		normalMode();
 	}
 
+	currentState = STATE_SAMPLING;
 	Serial.println("Finished setup");
 }
 
 void loop()
 {
-	if (sent)
-	{
-		actuallySleep();
-	}
-	else if ((millis() - bootTime) > WAKE_TIMEOUT && !isCalibrationMode())
-	{
-		actuallySleep();
-	}
-	else if (nsamples < MAX_SAMPLES && mpu.getIntDataReadyStatus())
-	//else if (nsamples < MAX_SAMPLES)
-	{
-		int16_t ax, ay, az;
-		//ax = 1;
-		//ay = 2;
-		//az = 3;
-		mpu.getAcceleration(&ax, &az, &ay);
+    switch (currentState) {
+        case STATE_SAMPLING:
+            if (sent) {
+                currentState = STATE_SLEEPING;
+            }
+            else if ((millis() - bootTime) > WAKE_TIMEOUT && !isCalibrationMode()) {
+                currentState = STATE_SLEEPING;
+            }
+            else if (nsamples < MAX_SAMPLES && mpu.getIntDataReadyStatus()) {
+                int16_t ax, ay, az;
+                mpu.getAcceleration(&ax, &az, &ay);
 
-		float tilt = calculateTilt(ax, az, ay);
-		// Ignore zero readings as well as readings of precisely 90.
-		// Both of these indicate failures to read correct data from the MPU.
-		if (tilt > 0.0 && tilt != 90)
-		{
-			samples[nsamples++] = tilt;
-		}
+                float tilt = calculateTilt(ax, az, ay);
+                
+                // Ignore zero readings as well as readings of precisely 90.
+                // Both of these indicate failures to read correct data from the MPU.
+                if (tilt > 0.0 && tilt != 90) {
+                    samples[nsamples++] = tilt;
+                }
 
-		if (nsamples >= MAX_SAMPLES)
-		{
-			// As soon as we have all our samples, read the temperature.
-			// This offset is from the MPU documentation. Displays temperature in degrees C.
-			temperature = mpu.getTemperature() / 340.0 + 36.53;
-			//temperature = 25.0;
-
-			// ... and put the MPU back to sleep. No reason for it to
-			// be sampling while we're doing networky things.
-			putMpuToSleep();
-
-			// no need to wait for the delay
-			sendSensorData();
-		}
-	}
-
-	// mpu.getIntDataReadyStatus() hits the I2C bus. We don't need
-	// to poll every ms while we're gathering samples. Once we have
-	// the samples we're just waiting for the transmit to clear, so
-	// loop a bit quicker.
-	delay((nsamples < MAX_SAMPLES) ? 5 : 1);
+                if (nsamples >= MAX_SAMPLES) {
+                    // As soon as we have all our samples, read the temperature.
+                    // This offset is from the MPU documentation. Displays temperature in degrees C.
+                    temperature = mpu.getTemperature() / 340.0 + 36.53;
+                    
+                    // Put the MPU back to sleep immediately after data collection
+                    putMpuToSleep();
+                    
+                    currentState = STATE_PROCESSING;
+                }
+            }
+            
+            // mpu.getIntDataReadyStatus() hits the I2C bus. We don't need
+			// to poll every ms while we're gathering samples. Once we have
+			// the samples we're just waiting for the transmit to clear, so
+			// loop a bit quicker.
+            delay((nsamples < MAX_SAMPLES) ? 10 : 1);
+            break;
+            
+        case STATE_PROCESSING:
+            // Process data and prepare for transmission
+            currentState = STATE_TRANSMITTING;
+            break;
+            
+        case STATE_TRANSMITTING:
+            // Send sensor data through ESP-NOW
+            sendSensorData();
+            currentState = STATE_SLEEPING;
+            break;
+            
+        case STATE_SLEEPING:
+            // Go to deep sleep
+            actuallySleep();
+            break;
+            
+        default:
+            // Should never reach here, but just in case reset to sampling state
+            currentState = STATE_SAMPLING;
+            break;
+    }
 }

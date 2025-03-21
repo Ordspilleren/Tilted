@@ -291,12 +291,16 @@ void button1Pressed(Button2 &btn)
     iotWebConf.forceApMode(true);
 }
 
-void screenUpdateVariables(float gravity, float temp)
-{
+// Layout constants
+#define STATUS_HEIGHT 20
+#define GRAPH_HEIGHT ((tft.height() - STATUS_HEIGHT) / 2)
+#define DATA_SECTION_Y (STATUS_HEIGHT + GRAPH_HEIGHT)
+
+void screenUpdateVariables(float gravity, float temp) {
     tft.setTextDatum(TC_DATUM);
     tft.setTextPadding(tft.textWidth("11.000", 4));
-    tft.drawString((String)gravity, tft.width() / 2, tft.height() / 2 + 60, 4);
-    tft.drawString((String)temp, tft.width() / 2, tft.height() / 2 + 100, 4);
+    tft.drawString((String)gravity, tft.width() / 2, DATA_SECTION_Y + 40, 4);
+    tft.drawString((String)temp, tft.width() / 2, DATA_SECTION_Y + 80, 4);
     tft.setTextPadding(0);
 }
 
@@ -361,31 +365,26 @@ void Trace(TFT_eSPI &tft, double x, double y,
     oy = y;
 }
 
-void drawGraph()
-{
+void drawGraph() {
     // No point in drawing the graph if we don't have at least two readings.
-    if (readingsHistory.size() < 2)
-    {
+    if (readingsHistory.size() < 2) {
         return;
     }
 
-    // Clear graph before update.
-    tft.fillRect(0, 0, tft.width(), tft.height() / 2, TFT_BLACK);
+    // Clear graph before update, but preserve status bar
+    tft.fillRect(0, STATUS_HEIGHT, tft.width(), GRAPH_HEIGHT, TFT_BLACK);
 
     // Draw rectangle around graph
-    tft.drawRect(0, 0, tft.width(), tft.height() / 2, TFT_WHITE);
+    tft.drawRect(0, STATUS_HEIGHT, tft.width(), GRAPH_HEIGHT, TFT_WHITE);
 
     float minValue = readingsHistory[0];
     float maxValue = 0;
 
-    for (int i = 0; i < readingsHistory.size(); i++)
-    {
-        if (readingsHistory[i] > maxValue)
-        {
+    for (int i = 0; i < readingsHistory.size(); i++) {
+        if (readingsHistory[i] > maxValue) {
             maxValue = readingsHistory[i];
         }
-        if (readingsHistory[i] < minValue)
-        {
+        if (readingsHistory[i] < minValue) {
             minValue = readingsHistory[i];
         }
     }
@@ -394,34 +393,71 @@ void drawGraph()
     double x, y;
     bool update1 = true;
     double ox = -999, oy = -999; // Force them to be off screen
-    for (int i = 0; i < readingsHistory.size(); i++)
-    {
+    for (int i = 0; i < readingsHistory.size(); i++) {
         x = i + 1;
         y = readingsHistory[i];
-        Trace(tft, x, y, 0, tft.height() / 2 - 10, tft.width(), tft.height() / 2 - 20, 1, readingsHistory.size(), minValue, maxValue, ox, oy, update1, TFT_YELLOW);
+        // Adjusted to account for status bar
+        Trace(tft, x, y, 0, STATUS_HEIGHT + GRAPH_HEIGHT - 10, tft.width(), GRAPH_HEIGHT - 20, 
+              1, readingsHistory.size(), minValue, maxValue, ox, oy, update1, TFT_YELLOW);
         Serial.printf("Update %f", x);
     }
 
     tft.setTextPadding(tft.textWidth("111.000", 2));
     tft.setTextDatum(ML_DATUM);
-    tft.drawFloat(readingsHistory.first(), 3, 0, tft.height() / 2 + 10, 2);
+    tft.drawFloat(readingsHistory.first(), 3, 0, DATA_SECTION_Y + 10, 2);
     tft.setTextDatum(MR_DATUM);
-    tft.drawFloat(readingsHistory.last(), 3, tft.width(), tft.height() / 2 + 10, 2);
+    tft.drawFloat(readingsHistory.last(), 3, tft.width(), DATA_SECTION_Y + 10, 2);
     tft.setTextPadding(0);
 }
 
-void prepareScreen()
-{
+void prepareScreen() {
     tft.init();
     tft.setRotation(0);
     tft.fillScreen(TFT_BLACK);
-
+    
+    // Battery indicator outline
+    tft.drawRect(tft.width() - 30, 5, 25, 12, TFT_WHITE);
+    tft.fillRect(tft.width() - 5, 8, 2, 6, TFT_WHITE);  // Battery tip
+    
     tft.setTextDatum(TL_DATUM);
-    tft.drawString("Gravity", 0, tft.height() / 2 + 45, 2);
-    tft.drawString("Temperature", 0, tft.height() / 2 + 85, 2);
+    tft.drawString("Gravity", 0, DATA_SECTION_Y + 25, 2);
+    tft.drawString("Temperature", 0, DATA_SECTION_Y + 65, 2);
 
-    // Draw rectangle around graph
-    tft.drawRect(0, 0, tft.width(), tft.height() / 2, TFT_WHITE);
+    // Draw rectangle around graph, adjusted for status bar
+    tft.drawRect(0, STATUS_HEIGHT, tft.width(), GRAPH_HEIGHT, TFT_WHITE);
+}
+
+// Update the battery indicator based on voltage
+void updateBatteryIndicator(int voltage) {
+    // Map voltage to a battery percentage (adjust these values for your battery)
+    // Assuming 3.0V is empty and 4.2V is full for a LiPo battery
+    int percentage = map(constrain(voltage, 2800, 3400), 2800, 3400, 0, 100);
+    
+    // Determine color based on percentage
+    uint16_t batteryColor;
+    if (percentage > 70) {
+        batteryColor = TFT_GREEN;
+    } else if (percentage > 30) {
+        batteryColor = TFT_YELLOW;
+    } else {
+        batteryColor = TFT_RED;
+    }
+    
+    // Clear the previous battery level
+    tft.fillRect(tft.width() - 29, 6, 23, 10, TFT_BLACK);
+    
+    // Draw the new battery level
+    int fillWidth = map(percentage, 0, 100, 0, 23);
+    tft.fillRect(tft.width() - 29, 6, fillWidth, 10, batteryColor);
+    
+    // Optionally display percentage
+    if (percentage < 20) {
+        // Display low battery warning
+        tft.setTextDatum(TR_DATUM);
+        tft.setTextColor(TFT_RED);
+        tft.drawString("Low", tft.width() - 35, 6, 1);
+        tft.setTextColor(TFT_WHITE);
+    }
 }
 
 void saveReading(float reading)
@@ -472,6 +508,10 @@ void loop()
     {
         haveReading = false;
         tiltGravity = calculateGravity();
+
+        // Update battery indicator with each new reading
+        updateBatteryIndicator(tiltData.volt);
+        
         screenUpdateVariables(tiltData.tilt, tiltData.temp);
         saveReading(tiltData.tilt);
         drawGraph();
