@@ -5,12 +5,13 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <tinyexpr.h>
-#include <IotWebConf.h>
+#include <Preferences.h>
 #include <InfluxDbClient.h>
 #include <Button2.h>
 #include <TFT_eSPI.h>
 #include <SPI.h>
 #include <CircularBuffer.h>
+#include <WebServer.h>
 
 // Button definitions
 #define BUTTON_1 35
@@ -21,43 +22,32 @@ Button2 btn2(BUTTON_2);
 // Init display
 TFT_eSPI tft = TFT_eSPI(135, 240);
 
-#define CONFIG_VERSION "tiltedgw1"
+// Preferences
+Preferences preferences;
 
-const char defaultDeviceName[] = "TiltedGateway";
+// Config variables
+String deviceName = "TiltedGateway";
+String wifiSSID = "";
+String wifiPassword = "";
+String polynomial = "";
+String mqttServer = "";
+String mqttTopic = "tilted/data";
+String brewfatherURL = "";
+String influxdbURL = "";
+String influxdbOrg = "";
+String influxdbBucket = "";
+String influxdbToken = "";
+String tiltedURL = "";
 
-const char defaultAPPassword[] = "tilted123";
+// AP mode settings
+const char* apSSID = "TiltedGateway-Setup";
+const char* apPassword = "tilted123";
 
-#define DEFAULT_MQTT_TOPIC "tilted/data"
-
-#define STRING_LEN 128
-
-char polynomial[STRING_LEN];
-char mqttServer[STRING_LEN];
-char mqttTopic[STRING_LEN];
-char brewfatherURL[STRING_LEN];
-char influxdbURL[STRING_LEN];
-char influxdbOrg[STRING_LEN];
-char influxdbBucket[STRING_LEN];
-char influxdbToken[STRING_LEN];
-
-DNSServer dnsServer;
-WebServer server(80);
-
-IotWebConf iotWebConf(defaultDeviceName, &dnsServer, &server, defaultAPPassword, CONFIG_VERSION);
-iotwebconf::ParameterGroup calibrationGroup = iotwebconf::ParameterGroup("Calibration", "");
-iotwebconf::TextParameter polynomialParam = iotwebconf::TextParameter("Polynomial", "polynomial", polynomial, STRING_LEN);
-iotwebconf::ParameterGroup mqttGroup = iotwebconf::ParameterGroup("MQTT", "");
-iotwebconf::TextParameter mqttServerParam = iotwebconf::TextParameter("MQTT Server", "mqttserver", mqttServer, STRING_LEN);
-iotwebconf::TextParameter mqttTopicParam = iotwebconf::TextParameter("MQTT Topic", "mqtttopic", mqttTopic, STRING_LEN, "text", NULL, DEFAULT_MQTT_TOPIC);
-iotwebconf::ParameterGroup brewfatherGroup = iotwebconf::ParameterGroup("Brewfather", "");
-iotwebconf::TextParameter brewfatherURLParam = iotwebconf::TextParameter("Brewfather URL", "brewfatherurl", brewfatherURL, STRING_LEN);
-iotwebconf::ParameterGroup influxdbGroup = iotwebconf::ParameterGroup("InfluxDB", "");
-iotwebconf::TextParameter influxdbURLParam = iotwebconf::TextParameter("InfluxDB URL", "influxdburl", influxdbURL, STRING_LEN);
-iotwebconf::TextParameter influxdbOrgParam = iotwebconf::TextParameter("InfluxDB Org", "influxdborg", influxdbOrg, STRING_LEN);
-iotwebconf::TextParameter influxdbBucketParam = iotwebconf::TextParameter("InfluxDB Bucket", "influxdbbucket", influxdbBucket, STRING_LEN);
-iotwebconf::TextParameter influxdbTokenParam = iotwebconf::TextParameter("InfluxDB Token", "influxdbtoken", influxdbToken, STRING_LEN);
-
+// Config mode flag
 bool configMode = false;
+
+// Web server
+WebServer server(80);
 
 #define RETRY_INTERVAL 5000
 
@@ -80,6 +70,7 @@ struct __attribute__((packed)) DataStruct
     long interval;
 };
 
+uint8_t sensorId[6];
 DataStruct tiltData;
 float tiltGravity = 0;
 
@@ -88,6 +79,122 @@ float tiltGravity = 0;
 CircularBuffer<float, 24> readingsHistory;
 
 volatile boolean haveReading = false;
+
+// HTML for configuration page
+const char CONFIG_HTML[] PROGMEM = R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Tilted Gateway Configuration</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
+            .form-group { margin-bottom: 15px; }
+            label { display: block; margin-bottom: 5px; }
+            input[type="text"], input[type="password"] { width: 100%; padding: 8px; box-sizing: border-box; }
+            button { background-color: #4CAF50; color: white; padding: 10px 15px; border: none; cursor: pointer; }
+            fieldset { margin-bottom: 20px; }
+            .section { margin-bottom: 30px; }
+        </style>
+    </head>
+    <body>
+        <h1>Tilted Gateway Configuration</h1>
+        <form action="/save" method="post">
+            <div class="section">
+                <fieldset>
+                    <legend>Device Settings</legend>
+                    <div class="form-group">
+                        <label for="deviceName">Device Name:</label>
+                        <input type="text" id="deviceName" name="deviceName" value="%DEVICE_NAME%">
+                    </div>
+                </fieldset>
+            </div>
+            
+            <div class="section">
+                <fieldset>
+                    <legend>WiFi Settings</legend>
+                    <div class="form-group">
+                        <label for="wifiSSID">WiFi SSID:</label>
+                        <input type="text" id="wifiSSID" name="wifiSSID" value="%WIFI_SSID%">
+                    </div>
+                    <div class="form-group">
+                        <label for="wifiPassword">WiFi Password:</label>
+                        <input type="password" id="wifiPassword" name="wifiPassword" value="%WIFI_PASSWORD%">
+                    </div>
+                </fieldset>
+            </div>
+            
+            <div class="section">
+                <fieldset>
+                    <legend>Calibration</legend>
+                    <div class="form-group">
+                        <label for="polynomial">Polynomial:</label>
+                        <input type="text" id="polynomial" name="polynomial" value="%POLYNOMIAL%">
+                    </div>
+                </fieldset>
+            </div>
+            
+            <div class="section">
+                <fieldset>
+                    <legend>MQTT Settings</legend>
+                    <div class="form-group">
+                        <label for="mqttServer">MQTT Server:</label>
+                        <input type="text" id="mqttServer" name="mqttServer" value="%MQTT_SERVER%">
+                    </div>
+                    <div class="form-group">
+                        <label for="mqttTopic">MQTT Topic:</label>
+                        <input type="text" id="mqttTopic" name="mqttTopic" value="%MQTT_TOPIC%">
+                    </div>
+                </fieldset>
+            </div>
+            
+            <div class="section">
+                <fieldset>
+                    <legend>Brewfather Settings</legend>
+                    <div class="form-group">
+                        <label for="brewfatherURL">Brewfather URL:</label>
+                        <input type="text" id="brewfatherURL" name="brewfatherURL" value="%BREWFATHER_URL%">
+                    </div>
+                </fieldset>
+            </div>
+            
+            <div class="section">
+                <fieldset>
+                    <legend>InfluxDB Settings</legend>
+                    <div class="form-group">
+                        <label for="influxdbURL">InfluxDB URL:</label>
+                        <input type="text" id="influxdbURL" name="influxdbURL" value="%INFLUXDB_URL%">
+                    </div>
+                    <div class="form-group">
+                        <label for="influxdbOrg">InfluxDB Org:</label>
+                        <input type="text" id="influxdbOrg" name="influxdbOrg" value="%INFLUXDB_ORG%">
+                    </div>
+                    <div class="form-group">
+                        <label for="influxdbBucket">InfluxDB Bucket:</label>
+                        <input type="text" id="influxdbBucket" name="influxdbBucket" value="%INFLUXDB_BUCKET%">
+                    </div>
+                    <div class="form-group">
+                        <label for="influxdbToken">InfluxDB Token:</label>
+                        <input type="text" id="influxdbToken" name="influxdbToken" value="%INFLUXDB_TOKEN%">
+                    </div>
+                </fieldset>
+            </div>
+
+            <div class="section">
+                <fieldset>
+                    <legend>Tilted API Settings</legend>
+                    <div class="form-group">
+                        <label for="tiltedURL">Tilted API URL:</label>
+                        <input type="text" id="tiltedURL" name="tiltedURL" value="%TILTED_URL%">
+                    </div>
+                </fieldset>
+            </div>
+            
+            <button type="submit">Save Configuration</button>
+        </form>
+    </body>
+    </html>
+    )rawliteral";
 
 float round3(float value)
 {
@@ -101,7 +208,7 @@ float calculateGravity()
     float gravity = 0;
     int err;
     te_variable vars[] = {{"tilt", &tilt}, {"temp", &temp}};
-    te_expr *expr = te_compile(polynomial, vars, 2, &err);
+    te_expr *expr = te_compile(polynomial.c_str(), vars, 2, &err);
 
     if (expr)
     {
@@ -119,6 +226,10 @@ float calculateGravity()
 void receiveCallBackFunction(const uint8_t *senderMac, const uint8_t *incomingData, int len)
 {
     memcpy(&tiltData, incomingData, len);
+
+    // Copy the MAC address into the data structure for identification
+    memcpy(sensorId, senderMac, 6);
+
     Serial.printf("Transmitter MacAddr: %02x:%02x:%02x:%02x:%02x:%02x, ", senderMac[0], senderMac[1], senderMac[2], senderMac[3], senderMac[4], senderMac[5]);
     Serial.printf("\nTilt: %.2f, ", tiltData.tilt);
     Serial.printf("\nTemperature: %.2f, ", tiltData.temp);
@@ -156,35 +267,37 @@ void initEspNow()
 void wifiConnect()
 {
     WiFi.mode(WIFI_STA);
-    WiFi.begin(iotWebConf.getWifiSsidParameter()->valueBuffer, iotWebConf.getWifiPasswordParameter()->valueBuffer);
+    WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
 
-    while (WiFi.status() != WL_CONNECTED)
-    {
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
         delay(250);
         Serial.print(".");
+        attempts++;
     }
 
-    Serial.print("\nWiFi connected, IP address: ");
-    Serial.println(WiFi.localIP());
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("\nWiFi connected, IP address: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("\nWiFi connection failed");
+    }
 }
 
 void reconnectMQTT()
 {
-    mqttClient.setServer(mqttServer, 1883);
+    mqttClient.setServer(mqttServer.c_str(), 1883);
 
-    while (!mqttClient.connected())
-    {
-        if (mqttClient.connect(iotWebConf.getThingName()))
-        {
+    int attempts = 0;
+    while (!mqttClient.connected() && attempts < 3) {
+        if (mqttClient.connect(deviceName.c_str())) {
             Serial.println("MQTT connected!");
-        }
-        else
-        {
+        } else {
             Serial.print("failed, rc = ");
             Serial.print(mqttClient.state());
             Serial.println(" try again in 5 seconds");
-            // Wait 5 seconds before retrying
             delay(5000);
+            attempts++;
         }
     }
 }
@@ -194,6 +307,11 @@ void publishMQTT()
     if (!mqttClient.connected())
     {
         reconnectMQTT();
+    }
+
+    if (!mqttClient.connected()) {
+        Serial.println("Failed to connect to MQTT server");
+        return;
     }
 
     const size_t capacity = JSON_OBJECT_SIZE(5);
@@ -208,7 +326,7 @@ void publishMQTT()
     String jsonString;
     serializeJson(doc, jsonString);
 
-    mqttClient.publish(mqttTopic, jsonString.c_str(), true);
+    mqttClient.publish(mqttTopic.c_str(), jsonString.c_str(), true);
     mqttClient.disconnect();
 }
 
@@ -218,7 +336,7 @@ void publishBrewfather()
     const size_t capacity = JSON_OBJECT_SIZE(5);
     DynamicJsonDocument doc(capacity);
 
-    doc["name"] = iotWebConf.getThingName();
+    doc["name"] = deviceName;
     doc["temp"] = tiltData.temp;
     doc["temp_unit"] = "C";
     doc["gravity"] = tiltGravity;
@@ -228,7 +346,7 @@ void publishBrewfather()
     serializeJson(doc, jsonBody);
 
     HTTPClient http;
-    http.begin(wifiClient, brewfatherURL);
+    http.begin(wifiClient, brewfatherURL.c_str());
     http.addHeader("Content-Type", "application/json");
     http.POST(jsonBody);
     http.end();
@@ -237,7 +355,7 @@ void publishBrewfather()
 void publishInfluxDB()
 {
     // Set tags
-    influxDataPoint.addTag("name", iotWebConf.getThingName());
+    influxDataPoint.addTag("name", deviceName.c_str());
     // Add data fields
     influxDataPoint.addField("gravity", tiltGravity, 3);
     influxDataPoint.addField("tilt", tiltData.tilt);
@@ -252,43 +370,176 @@ void publishInfluxDB()
     }
 }
 
-bool integrationEnabled(char *integrationVariable)
-{
-    return (integrationVariable[0] != '\0') ? true : false;
+String macToString(const uint8_t* mac) {
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return String(macStr);
 }
 
-void handleRoot()
+void publishTilted(const String& apiUrl)
 {
-    // -- Let IotWebConf test and handle captive portal requests.
-    if (iotWebConf.handleCaptivePortal())
-    {
-        // -- Captive portal request were already served.
+    if (apiUrl.isEmpty()) {
+        Serial.println("JSON API URL not configured, skipping...");
         return;
     }
-    String s = "<!DOCTYPE html><html lang=\"en\"><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, user-scalable=no\"/>";
-    s += "<title>IotWebConf 01 Minimal</title></head><body>Hello world!";
-    s += "Go to <a href='config'>configure page</a> to change settings.";
-    s += "</body></html>\n";
 
-    server.send(200, "text/html", s);
+    Serial.println("Sending to JSON API...");
+    const size_t capacity = JSON_OBJECT_SIZE(3) + JSON_OBJECT_SIZE(5);
+    DynamicJsonDocument doc(capacity);
+
+    // Create the nested reading object
+    JsonObject reading = doc.createNestedObject("reading");
+        
+    reading["sensorId"] = macToString(sensorId);
+    reading["tilt"] = tiltData.tilt;
+    reading["temp"] = tiltData.temp;
+    reading["volt"] = tiltData.volt;
+    reading["interval"] = tiltData.interval;
+    
+    // Add gateway identification
+    doc["gatewayId"] = WiFi.macAddress();
+    doc["gatewayName"] = deviceName;
+
+    String jsonBody;
+    serializeJson(doc, jsonBody);
+
+    HTTPClient http;
+    http.begin(wifiClient, apiUrl.c_str());
+    http.addHeader("Content-Type", "application/json");
+    
+    int httpResponseCode = http.POST(jsonBody);
+    
+    if (httpResponseCode > 0) {
+        Serial.print("JSON API HTTP Response code: ");
+        Serial.println(httpResponseCode);
+    } else {
+        Serial.print("JSON API Error code: ");
+        Serial.println(httpResponseCode);
+    }
+    
+    http.end();
 }
 
-void configSaved()
-{
-    Serial.println("Config has been saved, restarting...");
-    ESP.restart();
+bool integrationEnabled(String integration) {
+    return !integration.isEmpty();
+}
+
+// Load settings from Preferences
+void loadSettings() {
+    preferences.begin("tilted", false);
+    
+    deviceName = preferences.getString("deviceName", "TiltedGateway");
+    wifiSSID = preferences.getString("wifiSSID", "");
+    wifiPassword = preferences.getString("wifiPassword", "");
+    polynomial = preferences.getString("polynomial", "");
+    mqttServer = preferences.getString("mqttServer", "");
+    mqttTopic = preferences.getString("mqttTopic", "tilted/data");
+    brewfatherURL = preferences.getString("brewfatherURL", "");
+    influxdbURL = preferences.getString("influxdbURL", "");
+    influxdbOrg = preferences.getString("influxdbOrg", "");
+    influxdbBucket = preferences.getString("influxdbBucket", "");
+    influxdbToken = preferences.getString("influxdbToken", "");
+    tiltedURL = preferences.getString("tiltedURL", "");
+    
+    preferences.end();
+    
+    Serial.println("Settings loaded:");
+    Serial.println("Device Name: " + deviceName);
+    Serial.println("WiFi SSID: " + wifiSSID);
+    Serial.println("Polynomial: " + polynomial);
+    Serial.println("MQTT Server: " + mqttServer);
+    Serial.println("Tilted API URL: " + tiltedURL);
+}
+
+// Save settings to Preferences
+void saveSettings() {
+    preferences.begin("tilted", false);
+    
+    preferences.putString("deviceName", deviceName);
+    preferences.putString("wifiSSID", wifiSSID);
+    preferences.putString("wifiPassword", wifiPassword);
+    preferences.putString("polynomial", polynomial);
+    preferences.putString("mqttServer", mqttServer);
+    preferences.putString("mqttTopic", mqttTopic);
+    preferences.putString("brewfatherURL", brewfatherURL);
+    preferences.putString("influxdbURL", influxdbURL);
+    preferences.putString("influxdbOrg", influxdbOrg);
+    preferences.putString("influxdbBucket", influxdbBucket);
+    preferences.putString("influxdbToken", influxdbToken);
+    preferences.putString("tiltedURL", tiltedURL);
+    
+    preferences.end();
+    
+    Serial.println("Settings saved");
+}
+
+// Replace placeholders in HTML template
+String processTemplate() {
+    String html = CONFIG_HTML;
+    html.replace("%DEVICE_NAME%", deviceName);
+    html.replace("%WIFI_SSID%", wifiSSID);
+    html.replace("%WIFI_PASSWORD%", wifiPassword);
+    html.replace("%POLYNOMIAL%", polynomial);
+    html.replace("%MQTT_SERVER%", mqttServer);
+    html.replace("%MQTT_TOPIC%", mqttTopic);
+    html.replace("%BREWFATHER_URL%", brewfatherURL);
+    html.replace("%INFLUXDB_URL%", influxdbURL);
+    html.replace("%INFLUXDB_ORG%", influxdbOrg);
+    html.replace("%INFLUXDB_BUCKET%", influxdbBucket);
+    html.replace("%INFLUXDB_TOKEN%", influxdbToken);
+    html.replace("%TILTED_URL%", tiltedURL);
+    return html;
+}
+
+// Start AP mode and web server
+void startConfigMode() {
+    WiFi.disconnect();
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(apSSID, apPassword);
+    
+    Serial.println("AP Started");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.softAPIP());
+    
+    // Configure web server
+    server.on("/", HTTP_GET, []() {
+        server.send(200, "text/html", processTemplate());
+    });
+    
+    server.on("/save", HTTP_POST, []() {
+        deviceName = server.arg("deviceName");
+        wifiSSID = server.arg("wifiSSID");
+        wifiPassword = server.arg("wifiPassword");
+        polynomial = server.arg("polynomial");
+        mqttServer = server.arg("mqttServer");
+        mqttTopic = server.arg("mqttTopic");
+        brewfatherURL = server.arg("brewfatherURL");
+        influxdbURL = server.arg("influxdbURL");
+        influxdbOrg = server.arg("influxdbOrg");
+        influxdbBucket = server.arg("influxdbBucket");
+        influxdbToken = server.arg("influxdbToken");
+        tiltedURL = server.arg("tiltedURL");
+        
+        saveSettings();
+        
+        server.send(200, "text/html", 
+            "<html><head><meta http-equiv='refresh' content='5;url=/'></head>"
+            "<body><h1>Configuration Saved</h1>"
+            "<p>The device will restart in 5 seconds.</p></body></html>");
+            
+        delay(5000);
+        ESP.restart();
+    });
+    
+    server.begin();
+    configMode = true;
 }
 
 void button1Pressed(Button2 &btn)
 {
     Serial.println("Button pressed, going into config mode...");
-    configMode = true;
-    server.on("/", handleRoot);
-    server.on("/config", [] { iotWebConf.handleConfig(); });
-    server.onNotFound([]() { iotWebConf.handleNotFound(); });
-    iotWebConf.setConfigSavedCallback(&configSaved);
-    iotWebConf.init();
-    iotWebConf.forceApMode(true);
+    startConfigMode();
 }
 
 // Layout constants
@@ -471,26 +722,17 @@ void setup()
 
     btn1.setTapHandler(button1Pressed);
 
-    calibrationGroup.addItem(&polynomialParam);
-    mqttGroup.addItem(&mqttServerParam);
-    mqttGroup.addItem(&mqttTopicParam);
-    brewfatherGroup.addItem(&brewfatherURLParam);
-    influxdbGroup.addItem(&influxdbURLParam);
-    influxdbGroup.addItem(&influxdbOrgParam);
-    influxdbGroup.addItem(&influxdbBucketParam);
-    influxdbGroup.addItem(&influxdbTokenParam);
+    // Load settings
+    loadSettings();
 
-    iotWebConf.addParameterGroup(&calibrationGroup);
-    iotWebConf.addParameterGroup(&mqttGroup);
-    iotWebConf.addParameterGroup(&brewfatherGroup);
-    iotWebConf.addParameterGroup(&influxdbGroup);
-
-    iotWebConf.loadConfig();
-
-    // Disconnect from AP before initializing ESP-Now.
-    // This is needed because IoTWebConf for some reason sets up the AP with init().
-    //WiFi.softAPdisconnect(true);
-    initEspNow();
+    if (wifiSSID.isEmpty()) {
+        startConfigMode();
+    } else {
+        // Disconnect from AP before initializing ESP-Now.
+        // This is needed because IoTWebConf for some reason sets up the AP with init().
+        //WiFi.softAPdisconnect(true);
+        initEspNow();
+    }
 
     prepareScreen();
 }
@@ -501,7 +743,7 @@ void loop()
 
     if (configMode)
     {
-        iotWebConf.doLoop();
+        server.handleClient();
     }
 
     if (haveReading)
@@ -516,6 +758,10 @@ void loop()
         saveReading(tiltData.tilt);
         drawGraph();
         wifiConnect();
+        if (integrationEnabled(tiltedURL))
+        {
+            publishTilted(tiltedURL);
+        }
         if (integrationEnabled(mqttServer))
         {
             publishMQTT();
