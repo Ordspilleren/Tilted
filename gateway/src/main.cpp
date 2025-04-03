@@ -38,6 +38,8 @@ String influxdbOrg = "";
 String influxdbBucket = "";
 String influxdbToken = "";
 String tiltedURL = "";
+String tiltedUsername = "";
+String tiltedPassword = "";
 
 // AP mode settings
 const char* apSSID = "TiltedGateway-Setup";
@@ -58,6 +60,9 @@ PubSubClient mqttClient(wifiClient);
 // InfluxDB
 InfluxDBClient influxClient;
 Point influxDataPoint("tilted_data");
+
+// Tilted
+WiFiClientSecure secureClient;
 
 // the following three settings must match the slave settings
 uint8_t mac[] = {0x3A, 0x33, 0x33, 0x33, 0x33, 0x33};
@@ -186,6 +191,14 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
                     <div class="form-group">
                         <label for="tiltedURL">Tilted API URL:</label>
                         <input type="text" id="tiltedURL" name="tiltedURL" value="%TILTED_URL%">
+                    </div>
+                    <div class="form-group">
+                        <label for="tiltedUsername">Tilted Username:</label>
+                        <input type="text" id="tiltedUsername" name="tiltedUsername" value="%TILTED_USERNAME%">
+                    </div>
+                    <div class="form-group">
+                        <label for="tiltedPassword">Tilted Password:</label>
+                        <input type="password" id="tiltedPassword" name="tiltedPassword" value="%TILTED_PASSWORD%">
                     </div>
                 </fieldset>
             </div>
@@ -377,7 +390,7 @@ String macToString(const uint8_t* mac) {
     return String(macStr);
 }
 
-void publishTilted(const String& apiUrl)
+void publishTilted(const String& apiUrl, const String& username, const String& password)
 {
     if (apiUrl.isEmpty()) {
         Serial.println("JSON API URL not configured, skipping...");
@@ -392,6 +405,7 @@ void publishTilted(const String& apiUrl)
     JsonObject reading = doc.createNestedObject("reading");
         
     reading["sensorId"] = macToString(sensorId);
+    reading["gravity"] = tiltGravity;
     reading["tilt"] = tiltData.tilt;
     reading["temp"] = tiltData.temp;
     reading["volt"] = tiltData.volt;
@@ -404,9 +418,14 @@ void publishTilted(const String& apiUrl)
     String jsonBody;
     serializeJson(doc, jsonBody);
 
+    secureClient.setInsecure();
+
     HTTPClient http;
-    http.begin(wifiClient, apiUrl.c_str());
+    http.begin(secureClient, apiUrl.c_str());
     http.addHeader("Content-Type", "application/json");
+
+    // Add basic authentication
+    http.setAuthorization(username.c_str(), password.c_str());
     
     int httpResponseCode = http.POST(jsonBody);
     
@@ -441,6 +460,8 @@ void loadSettings() {
     influxdbBucket = preferences.getString("influxdbBucket", "");
     influxdbToken = preferences.getString("influxdbToken", "");
     tiltedURL = preferences.getString("tiltedURL", "");
+    tiltedUsername = preferences.getString("tiltedUsername", "");
+    tiltedPassword = preferences.getString("tiltedPassword", "");
     
     preferences.end();
     
@@ -468,6 +489,8 @@ void saveSettings() {
     preferences.putString("influxdbBucket", influxdbBucket);
     preferences.putString("influxdbToken", influxdbToken);
     preferences.putString("tiltedURL", tiltedURL);
+    preferences.putString("tiltedUsername", tiltedUsername);
+    preferences.putString("tiltedPassword", tiltedPassword);
     
     preferences.end();
     
@@ -489,6 +512,8 @@ String processTemplate() {
     html.replace("%INFLUXDB_BUCKET%", influxdbBucket);
     html.replace("%INFLUXDB_TOKEN%", influxdbToken);
     html.replace("%TILTED_URL%", tiltedURL);
+    html.replace("%TILTED_USERNAME%", tiltedUsername);
+    html.replace("%TILTED_PASSWORD%", tiltedPassword);
     return html;
 }
 
@@ -520,6 +545,8 @@ void startConfigMode() {
         influxdbBucket = server.arg("influxdbBucket");
         influxdbToken = server.arg("influxdbToken");
         tiltedURL = server.arg("tiltedURL");
+        tiltedUsername = server.arg("tiltedUsername");
+        tiltedPassword = server.arg("tiltedPassword");
         
         saveSettings();
         
@@ -547,11 +574,17 @@ void button1Pressed(Button2 &btn)
 #define GRAPH_HEIGHT ((tft.height() - STATUS_HEIGHT) / 2)
 #define DATA_SECTION_Y (STATUS_HEIGHT + GRAPH_HEIGHT)
 
-void screenUpdateVariables(float gravity, float temp) {
+void screenUpdateVariables(float gravity, float temp, float tilt) {
     tft.setTextDatum(TC_DATUM);
     tft.setTextPadding(tft.textWidth("11.000", 4));
-    tft.drawString((String)gravity, tft.width() / 2, DATA_SECTION_Y + 40, 4);
-    tft.drawString((String)temp, tft.width() / 2, DATA_SECTION_Y + 80, 4);
+    tft.drawFloat(gravity, 3, tft.width() / 2, DATA_SECTION_Y + 40, 4);
+    tft.drawFloat(temp, 2, tft.width() / 2, DATA_SECTION_Y + 80, 4);
+    tft.setTextPadding(0);
+
+    // Update tilt value in status bar
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextPadding(tft.textWidth("Tilt: 000.0", 1));
+    tft.drawString("Tilt: " + (String)tilt, 5, 5, 1);
     tft.setTextPadding(0);
 }
 
@@ -669,6 +702,10 @@ void prepareScreen() {
     // Battery indicator outline
     tft.drawRect(tft.width() - 30, 5, 25, 12, TFT_WHITE);
     tft.fillRect(tft.width() - 5, 8, 2, 6, TFT_WHITE);  // Battery tip
+
+    // Initialize tilt display area
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString("Tilt: 0.0", 5, 5, 1);
     
     tft.setTextDatum(TL_DATUM);
     tft.drawString("Gravity", 0, DATA_SECTION_Y + 25, 2);
@@ -754,13 +791,13 @@ void loop()
         // Update battery indicator with each new reading
         updateBatteryIndicator(tiltData.volt);
         
-        screenUpdateVariables(tiltData.tilt, tiltData.temp);
-        saveReading(tiltData.tilt);
+        screenUpdateVariables(tiltGravity, tiltData.temp, tiltData.tilt);
+        saveReading(tiltGravity);
         drawGraph();
         wifiConnect();
         if (integrationEnabled(tiltedURL))
         {
-            publishTilted(tiltedURL);
+            publishTilted(tiltedURL, tiltedUsername, tiltedPassword);
         }
         if (integrationEnabled(mqttServer))
         {

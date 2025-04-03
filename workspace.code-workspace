@@ -5,11 +5,15 @@
 		},
 		{
 			"path": "gateway"
+		},
+		{
+			"path": "server"
 		}
 	],
 	"settings": {
 		"files.associations": {
-			"*.tpp": "cpp"
+			"*.tpp": "cpp",
+			"*.old": "cpp"
 		}
 	}
 }
