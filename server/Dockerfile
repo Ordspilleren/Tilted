@@ -1,3 +1,9 @@
+# Build the web ui from source
+FROM docker.io/node:23 AS build-node
+WORKDIR /app/web
+ADD web ./
+RUN npm run build
+
 # Start from a Go base image
 FROM golang:1.24-alpine AS builder
 
@@ -11,7 +17,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 # Copy the source code
-COPY *.go ./
+COPY . ./
+COPY --link --from=build-node /app/web/build /app/web/build
 
 # Build the application
 RUN CGO_ENABLED=0 GOOS=linux go build -o tilted -a -ldflags '-extldflags "-static"' .
