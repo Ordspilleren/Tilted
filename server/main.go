@@ -1,7 +1,7 @@
 package main
 
 import (
-	"database/sql"
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -12,7 +12,8 @@ import (
 	"github.com/Ordspilleren/Tilted/server/web"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
-	_ "github.com/mattn/go-sqlite3"
+	"zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // SensorReading represents the data structure sent by the ESP32
@@ -50,17 +51,17 @@ type SensorData struct {
 	DataPoints  []DataPoint `json:"dataPoints"`
 }
 
-// Global database connection
-var db *sql.DB
+// Global database connection pool
+var dbPool *sqlitex.Pool
 
 func main() {
 	// Initialize SQLite database
 	var err error
-	db, err = initDB()
+	dbPool, err = initDB()
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
-	defer db.Close()
+	defer dbPool.Close()
 
 	// Create a new Echo instance
 	e := echo.New()
@@ -88,13 +89,21 @@ func main() {
 }
 
 // initDB initializes the SQLite database and creates necessary tables
-func initDB() (*sql.DB, error) {
+func initDB() (*sqlitex.Pool, error) {
 	databaseLocation := flag.String("database", "tilted.db", "")
 	flag.Parse()
-	db, err := sql.Open("sqlite3", fmt.Sprintf("%s?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=5000", *databaseLocation))
+
+	pool, err := sqlitex.NewPool(*databaseLocation, sqlitex.PoolOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %v", err)
 	}
+
+	// Get a connection to create tables
+	conn, err := pool.Take(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get database connection: %v", err)
+	}
+	defer pool.Put(conn)
 
 	// Create tables with a normalized schema
 	createTablesSQL := `
@@ -130,20 +139,18 @@ func initDB() (*sql.DB, error) {
     CREATE INDEX IF NOT EXISTS idx_readings_sensor_id ON readings(sensor_id);
     `
 
-	_, err = db.Exec(createTablesSQL)
+	err = sqlitex.ExecuteScript(conn, createTablesSQL, nil)
 	if err != nil {
-		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
 	// Enable foreign keys
-	_, err = db.Exec("PRAGMA foreign_keys = ON")
+	err = sqlitex.ExecuteTransient(conn, "PRAGMA foreign_keys = ON", nil)
 	if err != nil {
-		db.Close()
 		return nil, fmt.Errorf("failed to enable foreign keys: %v", err)
 	}
 
-	return db, nil
+	return pool, nil
 }
 
 // handleSensorData processes the incoming sensor readings from ESP32
@@ -178,68 +185,119 @@ func handleSensorData(c echo.Context) error {
 
 // saveToDatabase stores the sensor readings in SQLite with normalized schema
 func saveToDatabase(data *SensorReading) error {
-	tx, err := db.Begin()
+	// Get a connection from the pool
+	conn, err := dbPool.Take(context.Background())
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %v", err)
+		return fmt.Errorf("failed to get database connection: %v", err)
 	}
+	defer dbPool.Put(conn)
+
+	// Begin transaction using the Transaction helper
+	endTx := sqlitex.Transaction(conn)
 	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
+		// endTx will automatically commit on nil error or rollback on error
+		endTx(&err)
 	}()
 
 	// 1. Get or create sensor ID
 	var sensorInternalID int64
-	err = tx.QueryRow("SELECT id FROM sensors WHERE sensor_id = ?", data.Reading.SensorID).Scan(&sensorInternalID)
-	if err == sql.ErrNoRows {
+
+	found := false
+	err = sqlitex.Execute(conn,
+		"SELECT id FROM sensors WHERE sensor_id = ?",
+		&sqlitex.ExecOptions{
+			Args: []any{data.Reading.SensorID},
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				sensorInternalID = stmt.ColumnInt64(0)
+				found = true
+				return nil
+			},
+		})
+
+	if err != nil {
+		return fmt.Errorf("failed to query sensor: %v", err)
+	}
+
+	if !found {
 		// Insert new sensor
-		result, err := tx.Exec("INSERT INTO sensors (sensor_id) VALUES (?)", data.Reading.SensorID)
+		err = sqlitex.Execute(conn,
+			"INSERT INTO sensors (sensor_id) VALUES (?)",
+			&sqlitex.ExecOptions{
+				Args: []any{data.Reading.SensorID},
+			})
 		if err != nil {
 			return fmt.Errorf("failed to insert sensor: %v", err)
 		}
-		sensorInternalID, err = result.LastInsertId()
+
+		// Get the last insert ID
+		err = sqlitex.Execute(conn, "SELECT last_insert_rowid()", &sqlitex.ExecOptions{
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				sensorInternalID = stmt.ColumnInt64(0)
+				return nil
+			},
+		})
 		if err != nil {
 			return fmt.Errorf("failed to get sensor ID: %v", err)
 		}
-	} else if err != nil {
-		return fmt.Errorf("error checking for sensor: %v", err)
 	}
 
 	// 2. Get or create gateway ID
 	var gatewayInternalID int64
-	err = tx.QueryRow("SELECT id FROM gateways WHERE gateway_id = ? AND gateway_name = ?",
-		data.GatewayID, data.GatewayName).Scan(&gatewayInternalID)
-	if err == sql.ErrNoRows {
+
+	found = false
+	err = sqlitex.Execute(conn,
+		"SELECT id FROM gateways WHERE gateway_id = ? AND gateway_name = ?",
+		&sqlitex.ExecOptions{
+			Args: []any{data.GatewayID, data.GatewayName},
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				gatewayInternalID = stmt.ColumnInt64(0)
+				found = true
+				return nil
+			},
+		})
+
+	if err != nil {
+		return fmt.Errorf("failed to query gateway: %v", err)
+	}
+
+	if !found {
 		// Insert new gateway
-		result, err := tx.Exec("INSERT INTO gateways (gateway_id, gateway_name) VALUES (?, ?)",
-			data.GatewayID, data.GatewayName)
+		err = sqlitex.Execute(conn,
+			"INSERT INTO gateways (gateway_id, gateway_name) VALUES (?, ?)",
+			&sqlitex.ExecOptions{
+				Args: []any{data.GatewayID, data.GatewayName},
+			})
 		if err != nil {
 			return fmt.Errorf("failed to insert gateway: %v", err)
 		}
-		gatewayInternalID, err = result.LastInsertId()
+
+		// Get the last insert ID
+		err = sqlitex.Execute(conn, "SELECT last_insert_rowid()", &sqlitex.ExecOptions{
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				gatewayInternalID = stmt.ColumnInt64(0)
+				return nil
+			},
+		})
 		if err != nil {
 			return fmt.Errorf("failed to get gateway ID: %v", err)
 		}
-	} else if err != nil {
-		return fmt.Errorf("error checking for gateway: %v", err)
 	}
 
 	// 3. Insert reading with the current timestamp
 	timestamp := time.Now().UnixMilli()
-	_, err = tx.Exec(`
-		INSERT INTO readings (
+	err = sqlitex.Execute(conn,
+		`INSERT INTO readings (
 			timestamp, sensor_id, gateway_id, gravity, tilt, temp, volt, interval
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		timestamp, sensorInternalID, gatewayInternalID,
-		data.Reading.Gravity, data.Reading.Tilt, data.Reading.Temp,
-		data.Reading.Volt, data.Reading.Interval)
+		&sqlitex.ExecOptions{
+			Args: []any{
+				timestamp, sensorInternalID, gatewayInternalID,
+				data.Reading.Gravity, data.Reading.Tilt, data.Reading.Temp,
+				data.Reading.Volt, data.Reading.Interval,
+			},
+		})
 	if err != nil {
 		return fmt.Errorf("failed to insert reading: %v", err)
-	}
-
-	// Commit the transaction
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %v", err)
 	}
 
 	log.Printf("Successfully saved metrics to SQLite database")
@@ -248,8 +306,8 @@ func saveToDatabase(data *SensorReading) error {
 
 // healthCheck provides a simple health check endpoint
 func healthCheck(c echo.Context) error {
-	// Ping database to ensure connection is still alive
-	err := db.Ping()
+	// Get a connection from the pool to check if database is available
+	conn, err := dbPool.Take(context.Background())
 	if err != nil {
 		return c.JSON(http.StatusServiceUnavailable, map[string]string{
 			"status": "error",
@@ -257,6 +315,7 @@ func healthCheck(c echo.Context) error {
 			"time":   time.Now().Format(time.RFC3339),
 		})
 	}
+	dbPool.Put(conn)
 
 	return c.JSON(http.StatusOK, map[string]string{
 		"status": "ok",
@@ -266,30 +325,29 @@ func healthCheck(c echo.Context) error {
 
 // getSensorIDs retrieves all unique sensor IDs from the database
 func getSensorIDs(c echo.Context) error {
-	query := `SELECT sensor_id FROM sensors ORDER BY sensor_id`
+	// Get a connection from the pool
+	conn, err := dbPool.Take(context.Background())
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{
+			"error": fmt.Sprintf("Failed to get database connection: %v", err),
+		})
+	}
+	defer dbPool.Put(conn)
 
-	rows, err := db.Query(query)
+	var sensorIDs []string
+
+	err = sqlitex.Execute(conn,
+		"SELECT sensor_id FROM sensors ORDER BY sensor_id",
+		&sqlitex.ExecOptions{
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				sensorIDs = append(sensorIDs, stmt.ColumnText(0))
+				return nil
+			},
+		})
+
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{
 			"error": fmt.Sprintf("Error querying database: %v", err),
-		})
-	}
-	defer rows.Close()
-
-	var sensorIDs []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{
-				"error": fmt.Sprintf("Error scanning results: %v", err),
-			})
-		}
-		sensorIDs = append(sensorIDs, id)
-	}
-
-	if err := rows.Err(); err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{
-			"error": fmt.Sprintf("Error iterating results: %v", err),
 		})
 	}
 
@@ -321,6 +379,21 @@ func getSensorData(c echo.Context) error {
 	// Calculate the timestamp for hours ago
 	hoursAgo := time.Now().Add(-time.Duration(hours) * time.Hour).UnixMilli()
 
+	// Get a connection from the pool
+	conn, err := dbPool.Take(context.Background())
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{
+			"error": fmt.Sprintf("Failed to get database connection: %v", err),
+		})
+	}
+	defer dbPool.Put(conn)
+
+	// Prepare data structure for response
+	sensorData := SensorData{
+		SensorID:   sensorID,
+		DataPoints: []DataPoint{},
+	}
+
 	// Query the database for sensor data with JOINs to get the necessary information
 	query := `
     SELECT 
@@ -338,63 +411,33 @@ func getSensorData(c echo.Context) error {
         r.timestamp ASC
     `
 
-	rows, err := db.Query(query, sensorID, hoursAgo)
+	err = sqlitex.Execute(conn, query, &sqlitex.ExecOptions{
+		Args: []any{sensorID, hoursAgo},
+		ResultFunc: func(stmt *sqlite.Stmt) error {
+			// Set gateway info if not already set
+			if sensorData.GatewayID == "" {
+				sensorData.GatewayID = stmt.ColumnText(2)   // gateway_id
+				sensorData.GatewayName = stmt.ColumnText(3) // gateway_name
+			}
+
+			// Add data point
+			dataPoint := DataPoint{
+				Timestamp: stmt.ColumnInt64(0),      // timestamp
+				Gravity:   stmt.ColumnFloat(4),      // gravity
+				Tilt:      stmt.ColumnFloat(5),      // tilt
+				Temp:      stmt.ColumnFloat(6),      // temp
+				Volt:      stmt.ColumnFloat(7),      // volt
+				Interval:  int(stmt.ColumnInt64(8)), // interval
+			}
+
+			sensorData.DataPoints = append(sensorData.DataPoints, dataPoint)
+			return nil
+		},
+	})
+
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{
-			"error": fmt.Sprintf("Error querying database: %v", err),
-		})
-	}
-	defer rows.Close()
-
-	// Prepare data structure for response
-	sensorData := SensorData{
-		SensorID:   sensorID,
-		DataPoints: []DataPoint{},
-	}
-
-	// Process results
-	for rows.Next() {
-		var (
-			timestamp   int64
-			sensorIDStr string
-			gatewayID   string
-			gatewayName string
-			gravity     float64
-			tilt        float64
-			temp        float64
-			volt        float64
-			interval    int
-		)
-
-		if err := rows.Scan(&timestamp, &sensorIDStr, &gatewayID, &gatewayName,
-			&gravity, &tilt, &temp, &volt, &interval); err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{
-				"error": fmt.Sprintf("Error scanning row: %v", err),
-			})
-		}
-
-		// Set gateway info if not already set
-		if sensorData.GatewayID == "" {
-			sensorData.GatewayID = gatewayID
-			sensorData.GatewayName = gatewayName
-		}
-
-		// Add data point
-		dataPoint := DataPoint{
-			Timestamp: timestamp,
-			Gravity:   gravity,
-			Tilt:      tilt,
-			Temp:      temp,
-			Volt:      volt,
-			Interval:  interval,
-		}
-
-		sensorData.DataPoints = append(sensorData.DataPoints, dataPoint)
-	}
-
-	if err := rows.Err(); err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{
-			"error": fmt.Sprintf("Error iterating results: %v", err),
+			"error": fmt.Sprintf("Error querying data: %v", err),
 		})
 	}
 
