@@ -354,7 +354,7 @@ func getSensorIDs(c echo.Context) error {
 	return c.JSON(http.StatusOK, sensorIDs)
 }
 
-// getSensorData retrieves data for a specific sensor from the database
+// getSensorData retrieves data for a specific sensor from the database within a given time range
 func getSensorData(c echo.Context) error {
 	sensorID := c.Param("sensorId")
 	if sensorID == "" {
@@ -363,21 +363,47 @@ func getSensorData(c echo.Context) error {
 		})
 	}
 
-	// Get time range parameter (default to 24 hours)
-	hoursStr := c.QueryParam("hours")
-	hours := 24 // Default to 24 hours
-	if hoursStr != "" {
-		var err error
-		hours, err = strconv.Atoi(hoursStr)
+	// Get time range parameters
+	startTimeStr := c.QueryParam("startTime")
+	endTimeStr := c.QueryParam("endTime")
+
+	var startTime, endTime int64
+	var err error
+
+	// Default end time to now if not provided or invalid
+	if endTimeStr == "" {
+		endTime = time.Now().UnixMilli()
+	} else {
+		endTime, err = strconv.ParseInt(endTimeStr, 10, 64)
 		if err != nil {
-			return c.JSON(http.StatusBadRequest, map[string]string{
-				"error": "Invalid hours parameter",
-			})
+			// Log invalid parameter but default gracefully
+			log.Printf("Invalid endTime parameter: %s, defaulting to now. Error: %v", endTimeStr, err)
+			endTime = time.Now().UnixMilli()
 		}
 	}
 
-	// Calculate the timestamp for hours ago
-	hoursAgo := time.Now().Add(-time.Duration(hours) * time.Hour).UnixMilli()
+	// Default start time to 24 hours before end time if not provided or invalid
+	if startTimeStr == "" {
+		startTime = time.UnixMilli(endTime).Add(-24 * time.Hour).UnixMilli()
+	} else {
+		startTime, err = strconv.ParseInt(startTimeStr, 10, 64)
+		if err != nil {
+			// Log invalid parameter but default gracefully
+			log.Printf("Invalid startTime parameter: %s, defaulting to 24h before (parsed/defaulted) endTime. Error: %v", startTimeStr, err)
+			startTime = time.UnixMilli(endTime).Add(-24 * time.Hour).UnixMilli()
+		}
+	}
+
+	// If parameters somehow result in an invalid range (e.g. user error or bad defaults from client)
+	// default to a valid 24h range ending at the determined (or defaulted) endTime.
+	if startTime > endTime {
+		log.Printf("startTime (%d) was after endTime (%d), adjusting startTime to 24h before endTime", startTime, endTime)
+		startTime = time.UnixMilli(endTime).Add(-24 * time.Hour).UnixMilli()
+		// Alternative: return a 400 error
+		// return c.JSON(http.StatusBadRequest, map[string]string{
+		// 	"error": "startTime cannot be after endTime",
+		// })
+	}
 
 	// Get a connection from the pool
 	conn, err := dbPool.Take(context.Background())
@@ -389,7 +415,7 @@ func getSensorData(c echo.Context) error {
 	defer dbPool.Put(conn)
 
 	// Prepare data structure for response
-	sensorData := SensorData{
+	sensorDataResult := SensorData{
 		SensorID:   sensorID,
 		DataPoints: []DataPoint{},
 	}
@@ -406,18 +432,18 @@ func getSensorData(c echo.Context) error {
     JOIN 
         gateways g ON r.gateway_id = g.id
     WHERE 
-        s.sensor_id = ? AND r.timestamp >= ?
+        s.sensor_id = ? AND r.timestamp >= ? AND r.timestamp <= ?
     ORDER BY 
         r.timestamp ASC
     `
 
 	err = sqlitex.Execute(conn, query, &sqlitex.ExecOptions{
-		Args: []any{sensorID, hoursAgo},
+		Args: []any{sensorID, startTime, endTime},
 		ResultFunc: func(stmt *sqlite.Stmt) error {
-			// Set gateway info if not already set
-			if sensorData.GatewayID == "" {
-				sensorData.GatewayID = stmt.ColumnText(2)   // gateway_id
-				sensorData.GatewayName = stmt.ColumnText(3) // gateway_name
+			// Set gateway info if not already set (it should be the same for all readings of a sensor in a request)
+			if sensorDataResult.GatewayID == "" {
+				sensorDataResult.GatewayID = stmt.ColumnText(2)   // gateway_id
+				sensorDataResult.GatewayName = stmt.ColumnText(3) // gateway_name
 			}
 
 			// Add data point
@@ -430,7 +456,7 @@ func getSensorData(c echo.Context) error {
 				Interval:  int(stmt.ColumnInt64(8)), // interval
 			}
 
-			sensorData.DataPoints = append(sensorData.DataPoints, dataPoint)
+			sensorDataResult.DataPoints = append(sensorDataResult.DataPoints, dataPoint)
 			return nil
 		},
 	})
@@ -441,5 +467,10 @@ func getSensorData(c echo.Context) error {
 		})
 	}
 
-	return c.JSON(http.StatusOK, sensorData)
+	// If no data points were found, GatewayID and GatewayName might be empty.
+	// If sensorDataResult.DataPoints is empty and you still want to show gateway/sensor info,
+	// you might need a separate query for sensor metadata if it's critical.
+	// For now, if no data points, these might remain empty in the response.
+
+	return c.JSON(http.StatusOK, sensorDataResult)
 }
