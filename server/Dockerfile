@@ -2,6 +2,7 @@
 FROM docker.io/node:23 AS build-node
 WORKDIR /app/web
 ADD web ./
+RUN npm install
 RUN npm run build
 
 # Start from a Go base image
@@ -24,7 +25,7 @@ COPY --link --from=build-node /app/web/build /app/web/build
 RUN CGO_ENABLED=0 GOOS=linux go build -o tilted -a -ldflags '-extldflags "-static"' .
 
 # Use a minimal alpine image for the final image
-FROM alpine:3.17
+FROM alpine:3.22
 
 # Add ca-certificates for HTTPS requests to VictoriaMetrics
 RUN apk --no-cache add ca-certificates tzdata
